@@ -49,7 +49,7 @@ MAX_SURVEYS_PER_BATCH = 10
 IDENTITY_TYPES = [
     'full name', 'first name', 'last name', 'e-mail', 'company', 'gender', 
     'country', 'age', 'title', 'role', 'phone number', 'location', 
-    'pin', 'passport', 'date of birth', 'uct', 'student number',
+    'pin', 'passport', 'date of birth', 'uct student number',
     'department', 'region', 'city', 'id number', 'marital status',
     'education level', 'english proficiency', 'email', 'surname',
     'name', 'contact', 'address', 'mobile', 'telephone', 'qualification',
@@ -947,7 +947,7 @@ def determine_identity_type(text):
     
     text_lower = text.lower().strip()
     
-     # Priority order for identity type detection
+     # Priority order for identity type detection - UPDATED to match user's exact specifications
     if any(name in text_lower for name in ['first name', 'firstname']):
         return 'First Name'
     elif any(name in text_lower for name in ['last name', 'lastname', 'surname']):
@@ -980,15 +980,13 @@ def determine_identity_type(text):
         return 'ID Number'
     elif 'passport' in text_lower or 'pin' in text_lower:
         return 'PIN/ Passport'
-    elif 'student number' in text_lower:
-        return 'Student Number'
-    elif 'uct' in text_lower:
-        return 'UCT'
+    elif 'uct student number' in text_lower or ('uct' in text_lower and 'student' in text_lower):
+        return 'UCT Student Number'
     elif any(dob in text_lower for dob in ['date of birth', 'dob', 'birth']):
         return 'Date of Birth'
     elif 'marital' in text_lower:
         return 'Marital Status'
-    elif any(edu in text_lower for edu in ['education', 'qualification', 'degree']):
+    elif any(edu in text_lower for edu in ['education level', 'education', 'qualification', 'degree']):
         return 'Education level'
     elif 'english proficiency' in text_lower or ('language' in text_lower and 'proficiency' in text_lower):
         return 'English Proficiency'
@@ -2991,7 +2989,7 @@ def determine_identity_type_improved(text, survey_id=None, question_id=None):
             if 'contact' in text_lower or 'prefer' in text_lower or 'best way' in text_lower:
                 return 'Contact Preference'
     
-     # Priority order for identity type detection
+    # Priority order for identity type detection - UPDATED to match user's exact specifications
     if any(name in text_lower for name in ['first name', 'firstname']):
         return 'First Name'
     elif any(name in text_lower for name in ['last name', 'lastname', 'surname']):
@@ -3024,15 +3022,13 @@ def determine_identity_type_improved(text, survey_id=None, question_id=None):
         return 'ID Number'
     elif 'passport' in text_lower or 'pin' in text_lower:
         return 'PIN/ Passport'
-    elif 'student number' in text_lower:
-        return 'Student Number'
-    elif 'uct' in text_lower:
-        return 'UCT'
+    elif 'uct student number' in text_lower or ('uct' in text_lower and 'student' in text_lower):
+        return 'UCT Student Number'
     elif any(dob in text_lower for dob in ['date of birth', 'dob', 'birth']):
         return 'Date of Birth'
     elif 'marital' in text_lower:
         return 'Marital Status'
-    elif any(edu in text_lower for edu in ['education', 'qualification', 'degree']):
+    elif any(edu in text_lower for edu in ['education level', 'education', 'qualification', 'degree']):
         return 'Education level'
     elif 'english proficiency' in text_lower or ('language' in text_lower and 'proficiency' in text_lower):
         return 'English Proficiency'
