@@ -852,7 +852,7 @@ def match_question_to_uid_final(question_text):
     return None
 
 def categorize_survey_by_ami_structure(title):
-    """Categorize survey based on AMI structure: Survey Stage, Respondent Type, Programme"""
+    """Categorize survey based on AMI structure: Survey Stage, Respondent Type, Programme with smart categorization for 'other'"""
     if not isinstance(title, str):
         return {"Survey Stage": "Other", "Respondent Type": "Participant", "Programme": "Custom"}
     
@@ -865,6 +865,12 @@ def categorize_survey_by_ami_structure(title):
             survey_stage = stage
             break
     
+    # Smart categorization for "Other" survey stages
+    if survey_stage == "Other":
+        smart_stage = smart_categorize_other_response(title, 'survey_stage')
+        if smart_stage != "Other":
+            survey_stage = smart_stage
+    
     # Determine Respondent Type
     respondent_type = "Participant"
     for resp_type, keywords in RESPONDENT_TYPES.items():
@@ -872,12 +878,24 @@ def categorize_survey_by_ami_structure(title):
             respondent_type = resp_type
             break
     
+    # Smart categorization for "Participant" (default) respondent types
+    if respondent_type == "Participant":
+        smart_resp = smart_categorize_other_response(title, 'respondent_type')
+        if smart_resp != "Other":
+            respondent_type = smart_resp
+    
     # Determine Programme
     programme = "Custom"
     for prog, keywords in PROGRAMMES.items():
         if any(keyword.lower() in title_lower for keyword in keywords):
             programme = prog
             break
+    
+    # Smart categorization for "Custom" programmes
+    if programme == "Custom":
+        smart_prog = smart_categorize_other_response(title, 'programme')
+        if smart_prog != "Other":
+            programme = smart_prog
     
     return {
         "Survey Stage": survey_stage,
@@ -1013,12 +1031,114 @@ def normalize_question_for_grouping(text):
     if not isinstance(text, str):
         return text
     
+    # Clean the text first
     cleaned = clean_question_text(text)
+    
+    # Convert to lowercase for comparison
     normalized = cleaned.lower().strip()
+    
+    # Remove common variations
     normalized = re.sub(r'\s*-\s*', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized)
     
     return normalized
+
+# Smart categorization patterns for "other" responses
+SMART_CATEGORIZATION_PATTERNS = {
+    'survey_stage': {
+        'pre': ['pre', 'before', 'initial', 'baseline', 'intake', 'onboarding', 'orientation'],
+        'during': ['during', 'mid', 'interim', 'progress', 'ongoing', 'current'],
+        'post': ['post', 'after', 'final', 'completion', 'exit', 'graduation', 'alumni'],
+        'follow-up': ['follow', 'followup', 'follow-up', 'later', 'subsequent', 'tracking']
+    },
+    'respondent_type': {
+        'participant': ['participant', 'learner', 'student', 'attendee', 'beneficiary', 'member'],
+        'staff': ['staff', 'employee', 'worker', 'team', 'internal', 'personnel'],
+        'manager': ['manager', 'supervisor', 'leader', 'director', 'head', 'executive'],
+        'facilitator': ['facilitator', 'trainer', 'instructor', 'coach', 'mentor', 'guide'],
+        'partner': ['partner', 'stakeholder', 'client', 'customer', 'vendor', 'supplier']
+    },
+    'programme': {
+        'leadership': ['leadership', 'management', 'executive', 'senior', 'strategic'],
+        'technical': ['technical', 'skills', 'training', 'development', 'capacity'],
+        'business': ['business', 'entrepreneurship', 'enterprise', 'commercial', 'startup'],
+        'governance': ['governance', 'compliance', 'regulatory', 'policy', 'legal'],
+        'finance': ['finance', 'financial', 'accounting', 'budget', 'investment']
+    }
+}
+
+def smart_categorize_other_response(text, category_type):
+    """Smart categorization of 'other' responses based on text patterns"""
+    if not isinstance(text, str) or not text.strip():
+        return "Uncategorized"
+    
+    text_lower = text.lower().strip()
+    
+    # Skip if it's just "other" or similar generic responses
+    generic_responses = ['other', 'others', 'n/a', 'na', 'not applicable', 'none', '']
+    if text_lower in generic_responses:
+        return "Other"
+    
+    patterns = SMART_CATEGORIZATION_PATTERNS.get(category_type, {})
+    
+    # Check each pattern category
+    for category, keywords in patterns.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return category.replace('_', ' ').title()
+    
+    # If no pattern matches, try to extract meaningful words
+    words = text_lower.split()
+    meaningful_words = [w for w in words if len(w) > 3 and w not in ['the', 'and', 'for', 'with', 'this', 'that']]
+    
+    if meaningful_words:
+        return f"Custom: {' '.join(meaningful_words[:2]).title()}"
+    
+    return "Other"
+
+def get_question_sort_order(question_text, question_category):
+    """Determine the sort order for questions based on logical survey flow"""
+    if not isinstance(question_text, str):
+        return 999
+    
+    text_lower = question_text.lower()
+    
+    # Headings should come first
+    if question_category == "Heading":
+        return 0
+    
+    # Contact/demographic info typically comes first
+    contact_keywords = ['name', 'email', 'contact', 'phone', 'company', 'organization']
+    if any(keyword in text_lower for keyword in contact_keywords):
+        return 1
+    
+    # Background/demographic questions
+    demographic_keywords = ['age', 'gender', 'location', 'country', 'experience', 'role', 'position']
+    if any(keyword in text_lower for keyword in demographic_keywords):
+        return 2
+    
+    # Program/survey specific questions
+    program_keywords = ['program', 'programme', 'course', 'training', 'development']
+    if any(keyword in text_lower for keyword in program_keywords):
+        return 3
+    
+    # Assessment/rating questions
+    assessment_keywords = ['rate', 'rating', 'scale', 'assess', 'evaluate', 'satisfaction']
+    if any(keyword in text_lower for keyword in assessment_keywords):
+        return 4
+    
+    # Open-ended feedback questions
+    feedback_keywords = ['feedback', 'comment', 'suggestion', 'improve', 'additional', 'anything else']
+    if any(keyword in text_lower for keyword in feedback_keywords):
+        return 5
+    
+    # Thank you/completion messages last
+    completion_keywords = ['thank', 'complete', 'finish', 'submit', 'done']
+    if any(keyword in text_lower for keyword in completion_keywords):
+        return 6
+    
+    # Default order for other questions
+    return 4
 
 # ============= CACHE MANAGEMENT =============
 def load_cached_survey_data():
@@ -1801,8 +1921,8 @@ def run_uid_match(question_bank, df_target):
     return run_uid_match_optimized(question_bank, df_target)
 
 # ============= EXPORT FUNCTIONS =============
-def prepare_export_data(df_final):
-    """Prepare export data split into identity and non-identity tables"""
+def prepare_export_data_improved(df_final):
+    """Prepare export data split into identity and non-identity tables with all required columns"""
     try:
         if df_final is None or df_final.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -1823,15 +1943,15 @@ def prepare_export_data(df_final):
             ]].copy()
             export_df_non_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'QUESTION_NUMBER', 'UID']
         
-        # Prepare identity export (Table 2)
+        # Prepare identity export (Table 2) - WITH question_number and UID
         export_df_identity = pd.DataFrame()
         if not identity_questions.empty:
             # Add ROWS_ID for identity questions
             identity_questions['ROWS_ID'] = range(1000000000, 1000000000 + len(identity_questions))
             export_df_identity = identity_questions[[
-                'survey_id', 'question_uid', 'ROWS_ID', 'identity_type'
+                'survey_id', 'question_uid', 'position', 'ROWS_ID', 'identity_type', 'Final_UID'
             ]].copy()
-            export_df_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'ROWS_ID', 'IDENTITY_TYPE']
+            export_df_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'QUESTION_NUMBER', 'ROWS_ID', 'IDENTITY_TYPE', 'UID']
         
         return export_df_non_identity, export_df_identity
         
@@ -2636,20 +2756,52 @@ elif st.session_state.page == "survey_categorization":
     if not filtered_df.empty:
         st.markdown("### 🔧 UID Assignment")
         
+        # Add sorting functionality
+        st.markdown("#### 📋 Sorted Question Order")
+        st.info("Questions are automatically sorted by logical survey flow: Headings → Contact Info → Demographics → Program Questions → Assessments → Feedback → Completion")
+        
+        # Apply question sorting if question_category column exists
+        if 'question_category' not in filtered_df.columns:
+            # Add question_category classification if missing
+            filtered_df['question_category'] = filtered_df['question_text'].apply(classify_question)
+        
+        # Add sort order column
+        filtered_df['sort_order'] = filtered_df.apply(
+            lambda row: get_question_sort_order(row['question_text'], row.get('question_category', '')), 
+            axis=1
+        )
+        
+        # Sort by sort_order, then by survey_count (higher first), then alphabetically
+        filtered_df = filtered_df.sort_values(
+            ['sort_order', 'survey_count', 'question_text'], 
+            ascending=[True, False, True]
+        ).reset_index(drop=True)
+        
         # Prepare UID options
         uid_options = [None]
         if st.session_state.question_bank is not None and not st.session_state.question_bank.empty:
             uid_options.extend([f"{row['UID']} - {row['HEADING_0']}" for _, row in st.session_state.question_bank.iterrows()])
         
-        # Display and edit questions with AMI structure
+        # Display and edit questions with AMI structure - SORTED
         display_columns = [
             "Survey Stage", "Respondent Type", "Programme", "question_text", "schema_type", 
             "is_choice", "survey_count", "Final_UID", "Change_UID", "required"
         ]
         
+        # Add missing columns if they don't exist
+        if "Final_UID" not in filtered_df.columns:
+            filtered_df["Final_UID"] = None
+        if "Change_UID" not in filtered_df.columns:
+            filtered_df["Change_UID"] = None
+        if "required" not in filtered_df.columns:
+            filtered_df["required"] = False
+        
         available_columns = [col for col in display_columns if col in filtered_df.columns]
         
-        edited_categorized_df = st.data_editor(
+        # Display the sorted and filtered questions
+        st.markdown(f"#### 📋 Questions ({len(filtered_df)} total)")
+        
+        edited_df = st.data_editor(
             filtered_df[available_columns],
             column_config={
                 "Survey Stage": st.column_config.TextColumn("Survey Stage", width="medium"),
@@ -2661,7 +2813,7 @@ elif st.session_state.page == "survey_categorization":
                 "survey_count": st.column_config.NumberColumn("Survey Count", width="small"),
                 "Final_UID": st.column_config.TextColumn("Current UID", width="medium"),
                 "Change_UID": st.column_config.SelectboxColumn(
-                    "Assign UID",
+                    "Change UID",
                     options=uid_options,
                     default=None,
                     width="large"
@@ -2670,383 +2822,21 @@ elif st.session_state.page == "survey_categorization":
             },
             disabled=["Survey Stage", "Respondent Type", "Programme", "question_text", "schema_type", "is_choice", "survey_count", "Final_UID"],
             hide_index=True,
-            height=500,
-            key="ami_categorized_editor"
+            height=500
         )
         
-        # Process UID changes
-        uid_changes_made = False
-        for idx, row in edited_categorized_df.iterrows():
-            if pd.notnull(row.get("Change_UID")):
-                new_uid = row["Change_UID"].split(" - ")[0]
-                categorized_df.at[idx, "Final_UID"] = new_uid
-                categorized_df.at[idx, "configured_final_UID"] = new_uid
-                uid_changes_made = True
-        
-        # Action buttons
-        st.markdown("### 🚀 Actions")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("💾 Save UID Assignments", use_container_width=True):
-                if uid_changes_made:
-                    st.session_state.df_final = categorized_df.copy()
-                    st.session_state.df_target = categorized_df.copy()
-                    st.session_state.categorized_questions = categorized_df.copy()
-                    st.markdown('<div class="success-card">✅ UID assignments saved successfully!</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown('<div class="warning-card">⚠️ No UID changes to save.</div>', unsafe_allow_html=True)
-        
-        with col2:
-            if st.button("🔧 Proceed to UID Matching", use_container_width=True):
-                st.session_state.df_target = categorized_df.copy()
-                st.session_state.page = "uid_matching"
-                st.rerun()
-        
-        with col3:
-            if st.button("📥 Export Category Data", use_container_width=True):
-                csv_data = categorized_df.to_csv(index=False)
-                st.download_button(
-                    "📥 Download CSV",
-                    csv_data,
-                    f"categorized_questions_{uuid4().hex[:8]}.csv",
-                    "text/csv",
-                    key="cat_download"
-                )
-        
-        # Summary by AMI structure
-        st.markdown("### 📊 Assignment Summary by AMI Structure")
-        
-        # Survey Stage summary
-        stage_summary = categorized_df.groupby('Survey Stage').agg({
-            'question_text': 'count',
-            'Final_UID': lambda x: x.notna().sum()
-        }).rename(columns={
-            'question_text': 'Total Questions',
-            'Final_UID': 'Assigned UIDs'
-        })
-        stage_summary['Assignment Rate %'] = (
-            stage_summary['Assigned UIDs'] / stage_summary['Total Questions'] * 100
-        ).round(2)
-        
-        st.markdown("#### 📋 By Survey Stage")
-        st.dataframe(stage_summary, use_container_width=True)
-        
-        # Respondent Type summary
-        resp_summary = categorized_df.groupby('Respondent Type').agg({
-            'question_text': 'count',
-            'Final_UID': lambda x: x.notna().sum()
-        }).rename(columns={
-            'question_text': 'Total Questions',
-            'Final_UID': 'Assigned UIDs'
-        })
-        resp_summary['Assignment Rate %'] = (
-            resp_summary['Assigned UIDs'] / resp_summary['Total Questions'] * 100
-        ).round(2)
-        
-        st.markdown("#### 👥 By Respondent Type")
-        st.dataframe(resp_summary, use_container_width=True)
-        
-        # Programme summary
-        prog_summary = categorized_df.groupby('Programme').agg({
-            'question_text': 'count',
-            'Final_UID': lambda x: x.notna().sum()
-        }).rename(columns={
-            'question_text': 'Total Questions',
-            'Final_UID': 'Assigned UIDs'
-        })
-        prog_summary['Assignment Rate %'] = (
-            prog_summary['Assigned UIDs'] / prog_summary['Total Questions'] * 100
-        ).round(2)
-        
-        st.markdown("#### 🎓 By Programme")
-        st.dataframe(prog_summary, use_container_width=True)
-        
+        # Download filtered results
+        csv_data = filtered_df.to_csv(index=False)
+        st.download_button(
+            "📥 Download Categorized Questions",
+            csv_data,
+            f"survey_ami_analysis_{uuid4().hex[:8]}.csv",
+            "text/csv",
+            key="survey_analysis_download"
+        )
+    
     else:
         st.info("ℹ️ No questions match the selected filters")
-    
-    # Survey title analysis with AMI structure
-    if st.expander("📋 Survey Title Analysis with AMI Structure", expanded=False):
-        st.markdown("### 📊 How Surveys Were Categorized using AMI Structure")
-        
-        if st.session_state.all_questions is not None:
-            survey_analysis = st.session_state.all_questions.groupby(['survey_title', 'survey_id']).first().reset_index()
-            
-            # Apply AMI structure categorization
-            categorization_data = survey_analysis['survey_title'].apply(categorize_survey_by_ami_structure)
-            categorization_df = pd.DataFrame(categorization_data.tolist())
-            survey_analysis = pd.concat([survey_analysis, categorization_df], axis=1)
-            
-            # Display with enhanced AMI structure columns
-            st.dataframe(
-                survey_analysis[['survey_title', 'Survey Stage', 'Respondent Type', 'Programme', 'survey_id']],
-                column_config={
-                    "survey_title": st.column_config.TextColumn("Survey Title", width="large"),
-                    "Survey Stage": st.column_config.TextColumn("Survey Stage", width="medium"),
-                    "Respondent Type": st.column_config.TextColumn("Respondent Type", width="medium"),
-                    "Programme": st.column_config.TextColumn("Programme", width="medium"),
-                    "survey_id": st.column_config.TextColumn("Survey ID", width="small")
-                },
-                use_container_width=True,
-                height=300
-            )
-            
-            # Download survey analysis
-            csv_survey_analysis = survey_analysis.to_csv(index=False)
-            st.download_button(
-                "📥 Download Survey Analysis",
-                csv_survey_analysis,
-                f"survey_ami_analysis_{uuid4().hex[:8]}.csv",
-                "text/csv",
-                key="survey_analysis_download"
-            )
-
-# ============= UID MATCHING PAGE =============
-elif st.session_state.page == "uid_matching":
-    st.markdown("## 🔧 UID Matching & Configuration")
-    st.markdown('<div class="data-source-info">🔄 <strong>Process:</strong> Match survey questions → Snowflake references → Assign UIDs</div>', unsafe_allow_html=True)
-    
-    if st.session_state.df_target is None or st.session_state.df_target.empty:
-        st.markdown('<div class="warning-card">⚠️ No survey data selected. Please select surveys first.</div>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📋 Go to Survey Selection"):
-                st.session_state.page = "survey_selection"
-                st.rerun()
-        with col2:
-            if st.button("📊 Go to AMI Categories"):
-                st.session_state.page = "survey_categorization"
-                st.rerun()
-        st.stop()
-    
-    # Show survey data info
-    st.markdown("### 📊 Current Survey Data")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Questions", len(st.session_state.df_target))
-    with col2:
-        main_q = len(st.session_state.df_target[st.session_state.df_target["is_choice"] == False])
-        st.metric("Main Questions", main_q)
-    with col3:
-        if 'survey_id' in st.session_state.df_target.columns:
-            surveys = st.session_state.df_target["survey_id"].nunique()
-            st.metric("Surveys", surveys)
-        else:
-            st.metric("Surveys", "N/A")
-    
-    # Run UID Matching
-    if st.session_state.df_final is None or st.button("🚀 Run UID Matching", type="primary"):
-        try:
-            with st.spinner("🔄 Running optimized UID matching (using simple question bank for speed)..."):
-                # Use simple question bank for faster matching
-                if st.session_state.question_bank is not None and not st.session_state.question_bank.empty:
-                    # Show optimization info
-                    st.info("⚡ **Performance Optimized:** Using simple question bank (HEADING_0 → UID) for faster matching instead of enhanced version")
-                    
-                    # Create progress placeholder
-                    progress_placeholder = st.empty()
-                    progress_placeholder.write("📊 Phase 1: TF-IDF similarity calculation with simple question bank...")
-                    
-                    # Use the simple question bank for matching (faster)
-                    st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
-                    
-                    progress_placeholder.write("✅ Matching completed successfully!")
-                    time.sleep(1)
-                    progress_placeholder.empty()
-                else:
-                    st.warning("⚠️ Simple question bank not available. Loading basic version...")
-                    try:
-                        # Load simple question bank if not available
-                        st.session_state.question_bank = run_snowflake_reference_query()
-                        if not st.session_state.question_bank.empty:
-                            st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
-                        else:
-                            st.session_state.df_final = st.session_state.df_target.copy()
-                            st.session_state.df_final["Final_UID"] = None
-                    except Exception as e:
-                        st.session_state.df_final = st.session_state.df_target.copy()
-                        st.session_state.df_final["Final_UID"] = None
-        except Exception as e:
-            st.markdown('<div class="warning-card">⚠️ UID matching failed. Continuing without UIDs.</div>', unsafe_allow_html=True)
-            st.session_state.df_final = st.session_state.df_target.copy()
-            st.session_state.df_final["Final_UID"] = None
-
-    if st.session_state.df_final is not None:
-        # Matching Results
-        matched_percentage = calculate_matched_percentage(st.session_state.df_final)
-        
-        # Results Header
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("🎯 Match Rate", f"{matched_percentage}%")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            high_conf = len(st.session_state.df_final[st.session_state.df_final.get("Match_Confidence", "") == "✅ High"])
-            st.metric("✅ High Confidence", high_conf)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            low_conf = len(st.session_state.df_final[st.session_state.df_final.get("Match_Confidence", "") == "⚠️ Low"])
-            st.metric("⚠️ Low Confidence", low_conf)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col4:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            no_match = len(st.session_state.df_final[st.session_state.df_final.get("Final_UID", pd.Series()).isna()])
-            st.metric("❌ No Match", no_match)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        st.markdown("### 🔍 UID Matching Results")
-        
-        # Filters
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            show_main_only = st.checkbox("Show main questions only", value=True)
-        with col2:
-            match_filter = st.multiselect(
-                "Filter by match status:",
-                ["✅ High", "⚠️ Low", "🧠 Semantic", "❌ No match"],
-                default=["✅ High", "⚠️ Low", "🧠 Semantic"]
-            )
-        with col3:
-            schema_filter = st.multiselect(
-                "Filter by question type:",
-                ["Single Choice", "Multiple Choice", "Open-Ended", "Matrix"],
-                default=["Single Choice", "Multiple Choice", "Open-Ended", "Matrix"]
-            )
-        
-        # Search
-        search_query = st.text_input("🔍 Search questions/choices:")
-        
-        # Apply filters
-        result_df = st.session_state.df_final.copy()
-        if search_query:
-            result_df = result_df[result_df["question_text"].str.contains(search_query, case=False, na=False)]
-        if match_filter and "Final_Match_Type" in result_df.columns:
-            result_df = result_df[result_df["Final_Match_Type"].isin(match_filter)]
-        if show_main_only:
-            result_df = result_df[result_df["is_choice"] == False]
-        if schema_filter:
-            result_df = result_df[result_df["schema_type"].isin(schema_filter)]
-        
-        # Configure UIDs
-        if not result_df.empty:
-            uid_options = [None]
-            if st.session_state.question_bank is not None:
-                uid_options.extend([f"{row['UID']} - {row['HEADING_0']}" for _, row in st.session_state.question_bank.iterrows()])
-            
-            # Create required column if it doesn't exist
-            if "required" not in result_df.columns:
-                result_df["required"] = False
-            
-            display_columns = ["question_uid", "question_text", "schema_type", "is_choice"]
-            if "Final_UID" in result_df.columns:
-                display_columns.append("Final_UID")
-            if "Change_UID" not in result_df.columns:
-                result_df["Change_UID"] = None
-            display_columns.append("Change_UID")
-            display_columns.append("required")
-            
-            # Only show columns that exist
-            available_columns = [col for col in display_columns if col in result_df.columns]
-            
-            edited_df = st.data_editor(
-                result_df[available_columns],
-                column_config={
-                    "question_uid": st.column_config.TextColumn("Question ID", width="medium"),
-                    "question_text": st.column_config.TextColumn("Question/Choice", width="large"),
-                    "schema_type": st.column_config.TextColumn("Type", width="medium"),
-                    "is_choice": st.column_config.CheckboxColumn("Is Choice", width="small"),
-                    "Final_UID": st.column_config.TextColumn("Current UID", width="medium"),
-                    "Change_UID": st.column_config.SelectboxColumn(
-                        "Change UID",
-                        options=uid_options,
-                        default=None,
-                        width="large"
-                    ),
-                    "required": st.column_config.CheckboxColumn("Required", width="small")
-                },
-                disabled=["question_uid", "question_text", "schema_type", "is_choice", "Final_UID"],
-                hide_index=True,
-                height=400
-            )
-            
-            # Apply UID changes
-            for idx, row in edited_df.iterrows():
-                if pd.notnull(row.get("Change_UID")):
-                    new_uid = row["Change_UID"].split(" - ")[0]
-                    st.session_state.df_final.at[idx, "Final_UID"] = new_uid
-                    st.session_state.df_final.at[idx, "configured_final_UID"] = new_uid
-                    st.session_state.uid_changes[idx] = new_uid
-        
-        # Export Section
-        st.markdown("---")
-        st.markdown("### 📥 Export & Upload")
-        
-        # Prepare export data - now returns two tables
-        export_df_non_identity, export_df_identity = prepare_export_data(st.session_state.df_final)
-        
-        if not export_df_non_identity.empty or not export_df_identity.empty:
-            
-            # Show metrics for both tables
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("📊 Non-Identity Questions", len(export_df_non_identity))
-            with col2:
-                st.metric("🔐 Identity Questions", len(export_df_identity))
-            with col3:
-                total_records = len(export_df_non_identity) + len(export_df_identity)
-                st.metric("📋 Total Records", total_records)
-            
-            # Preview both tables
-            st.markdown("#### 👁️ Preview Data for Export")
-            
-            # Non-Identity Questions Preview
-            if not export_df_non_identity.empty:
-                st.markdown("**📊 Non-Identity Questions (Table 1)**")
-                st.dataframe(export_df_non_identity.head(10), use_container_width=True)
-            
-            # Identity Questions Preview  
-            if not export_df_identity.empty:
-                st.markdown("**🔐 Identity Questions (Table 2)**")
-                st.dataframe(export_df_identity.head(10), use_container_width=True)
-            
-            # Download options
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if not export_df_non_identity.empty:
-                    csv_data_non_identity = export_df_non_identity.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download Non-Identity CSV",
-                        csv_data_non_identity,
-                        f"non_identity_questions_{uuid4().hex[:8]}.csv",
-                        "text/csv",
-                        use_container_width=True
-                    )
-            
-            with col2:
-                if not export_df_identity.empty:
-                    csv_data_identity = export_df_identity.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download Identity CSV", 
-                        csv_data_identity,
-                        f"identity_questions_{uuid4().hex[:8]}.csv",
-                        "text/csv",
-                        use_container_width=True
-                    )
-            
-            with col3:
-                if st.button("🚀 Upload Both Tables to Snowflake", use_container_width=True):
-                    upload_to_snowflake_tables(export_df_non_identity, export_df_identity)
-
-        else:
-            st.warning("⚠️ No data available for export")
 
 # ============= SURVEY CREATION PAGE =============
 elif st.session_state.page == "survey_creation":
@@ -3161,7 +2951,87 @@ with footer_col3:
             st.write(f"Configured: {configured_count}")
         except:
             st.write("Configured: Error")
+
+    # Show survey data info
+    st.markdown("### 📊 Current Survey Data")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        # Count headings instead of total questions  
+        headings_count = len(st.session_state.df_target[st.session_state.df_target.get("question_category", "") == "Heading"])
+        st.metric("📑 Headings", headings_count)
+    with col2:
+        main_q = len(st.session_state.df_target[st.session_state.df_target["is_choice"] == False])
+        st.metric("Main Questions", main_q)
+    with col3:
+        if 'survey_id' in st.session_state.df_target.columns:
+            surveys = st.session_state.df_target["survey_id"].nunique()
+            st.metric("Surveys", surveys)
+        else:
+            st.metric("Surveys", "N/A")
 # ============= END OF SCRIPT =============
+
+def determine_identity_type_improved(text, survey_id=None, question_id=None):
+    """Determine the specific identity type from question text with survey context"""
+    if not isinstance(text, str):
+        return 'Unknown'
+    
+    text_lower = text.lower().strip()
+    
+    # Special handling for specific survey/question combinations
+    if survey_id == "523232875" and question_id == "247436134":
+        # This specific case is not phone number based on user feedback
+        if 'phone' in text_lower or 'mobile' in text_lower:
+            # Check if it's actually asking for contact preference rather than phone number
+            if 'contact' in text_lower or 'prefer' in text_lower or 'best way' in text_lower:
+                return 'Contact Preference'
+    
+     # Priority order for identity type detection
+    if any(name in text_lower for name in ['first name', 'firstname']):
+        return 'First Name'
+    elif any(name in text_lower for name in ['last name', 'lastname', 'surname']):
+        return 'Last Name'
+    elif any(name in text_lower for name in ['full name']) or ('name' in text_lower and 'first' not in text_lower and 'last' not in text_lower and 'company' not in text_lower):
+        return 'Full Name'
+    elif any(email in text_lower for email in ['email', 'e-mail', 'mail']):
+        return 'E-Mail'
+    elif any(company in text_lower for company in ['company', 'organization', 'organisation']):
+        return 'Company'
+    elif any(phone in text_lower for phone in ['phone', 'mobile', 'telephone']):
+        return 'Phone Number'
+    elif 'gender' in text_lower or 'sex' in text_lower:
+        return 'Gender'
+    elif 'age' in text_lower:
+        return 'Age'
+    elif any(title in text_lower for title in ['title', 'position', 'role', 'job']):
+        return 'Title/Role'
+    elif 'country' in text_lower:
+        return 'Country'
+    elif 'region' in text_lower:
+        return 'Region'
+    elif 'city' in text_lower:
+        return 'City'
+    elif 'department' in text_lower:
+        return 'Department'
+    elif any(loc in text_lower for loc in ['location', 'address']):
+        return 'Location'
+    elif any(id_type in text_lower for id_type in ['id number', 'identification']):
+        return 'ID Number'
+    elif 'passport' in text_lower or 'pin' in text_lower:
+        return 'PIN/ Passport'
+    elif 'student number' in text_lower:
+        return 'Student Number'
+    elif 'uct' in text_lower:
+        return 'UCT'
+    elif any(dob in text_lower for dob in ['date of birth', 'dob', 'birth']):
+        return 'Date of Birth'
+    elif 'marital' in text_lower:
+        return 'Marital Status'
+    elif any(edu in text_lower for edu in ['education', 'qualification', 'degree']):
+        return 'Education level'
+    elif 'english proficiency' in text_lower or ('language' in text_lower and 'proficiency' in text_lower):
+        return 'English Proficiency'
+    else:
+        return 'Other'
 
 
 
