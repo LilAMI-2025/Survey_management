@@ -2264,72 +2264,154 @@ elif st.session_state.page == "question_bank":
     
     st.markdown("---")
     
-    # Snowflake Question Bank (if available) - LOAD DATA BUT DON'T DISPLAY
+    # Snowflake Question Bank (Enhanced) - DISPLAY FOR REFERENCE
     if sf_status:
         try:
-            # Load data in background for functionality but don't display the enhanced section
-            with st.spinner("📊 Loading question bank data in background..."):
+            # Load enhanced data for display and simple data for matching
+            with st.spinner("📊 Loading enhanced question bank for display..."):
                 question_bank_with_authority = get_question_bank_with_authority_count()
             
             if not question_bank_with_authority.empty:
                 st.session_state.question_bank_with_authority = question_bank_with_authority
                 
-                # Create Unique UID Table functionality (keep this)
-                st.markdown("### 🎯 Unique UID Table Management")
-                col1, col2 = st.columns(2)
+                st.markdown("### ❄️ Snowflake Question Bank (Enhanced)")
+                
+                # Enhanced metrics with UID Final info
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    total_records = len(question_bank_with_authority)
+                    st.metric("📊 Total Records", f"{total_records:,}")
+                with col2:
+                    unique_uids = question_bank_with_authority['UID'].nunique()
+                    st.metric("🆔 Unique UIDs", f"{unique_uids:,}")
+                with col3:
+                    unique_questions = question_bank_with_authority['HEADING_0'].nunique()
+                    st.metric("📝 Unique Questions", f"{unique_questions:,}")
+                with col4:
+                    uid_final_matches = question_bank_with_authority['UID_FINAL'].notna().sum()
+                    st.metric("🎯 UID Final Matches", f"{uid_final_matches:,}")
+                
+                # Show UID Final coverage
+                if 'UID_FINAL' in question_bank_with_authority.columns:
+                    coverage_percentage = (uid_final_matches / total_records) * 100
+                    st.markdown(f'<div class="info-card">📊 <strong>UID Final Coverage:</strong> {coverage_percentage:.1f}% of Snowflake questions have UID Final reference</div>', unsafe_allow_html=True)
+                
+                # Filters for Snowflake data
+                st.markdown("#### 🔍 Filter Enhanced Question Bank")
+                col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
-                    if st.button("🔧 Create Unique UID Table", type="primary", use_container_width=True):
-                        with st.spinner("🔄 Creating unique UID table..."):
-                            unique_uid_table = create_unique_uid_table(question_bank_with_authority)
-                            st.session_state.unique_uid_table = unique_uid_table
-                        
-                        if not unique_uid_table.empty:
-                            st.markdown('<div class="success-card">✅ Unique UID table created successfully!</div>', unsafe_allow_html=True)
-                            
-                            # Show metrics for unique table
-                            col1_inner, col2_inner, col3_inner = st.columns(3)
-                            with col1_inner:
-                                st.metric("🆔 Unique UIDs", len(unique_uid_table))
-                            with col2_inner:
-                                uid_final_refs = unique_uid_table['SOURCE'].value_counts().get('UID Final Reference', 0)
-                                st.metric("🎯 From UID Final", uid_final_refs)
-                            with col3_inner:
-                                authority_refs = unique_uid_table['SOURCE'].value_counts().get('Authority Count', 0)
-                                st.metric("📊 From Authority", authority_refs)
-                        else:
-                            st.error("❌ Failed to create unique UID table")
-                
+                    uid_filter = st.text_input("🆔 Filter by UID (exact match):")
                 with col2:
-                    if hasattr(st.session_state, 'unique_uid_table') and not st.session_state.unique_uid_table.empty:
-                        csv_unique = st.session_state.unique_uid_table.to_csv(index=False)
-                        st.download_button(
-                            "📥 Download Unique UID Table",
-                            csv_unique,
-                            f"unique_uid_table_{uuid4().hex[:8]}.csv",
-                            "text/csv",
-                            use_container_width=True
-                        )
+                    uid_final_filter = st.text_input("🎯 Filter by UID Final:")
+                with col3:
+                    min_authority = st.number_input("📊 Minimum Authority Count:", min_value=1, value=1)
+                with col4:
+                    search_text = st.text_input("🔍 Search question text:")
                 
-                # Display unique UID table if it exists
-                if hasattr(st.session_state, 'unique_uid_table') and not st.session_state.unique_uid_table.empty:
-                    st.markdown("#### 🎯 Unique UID Table Preview")
+                # UID Final filter options
+                col1, col2 = st.columns(2)
+                with col1:
+                    show_uid_final_only = st.checkbox("Show only questions with UID Final", value=False)
+                with col2:
+                    show_conflicts_only = st.checkbox("Show only UID conflicts", value=False)
+                
+                # Apply filters
+                filtered_df = question_bank_with_authority.copy()
+                
+                if uid_filter:
+                    filtered_df = filtered_df[filtered_df['UID'].astype(str) == uid_filter]
+                
+                if uid_final_filter:
+                    filtered_df = filtered_df[filtered_df['UID_FINAL'].astype(str) == uid_final_filter]
+                
+                if min_authority > 1:
+                    filtered_df = filtered_df[filtered_df['AUTHORITY_COUNT'] >= min_authority]
+                
+                if search_text:
+                    filtered_df = filtered_df[
+                        filtered_df['HEADING_0'].str.contains(search_text, case=False, na=False)
+                    ]
+                
+                if show_uid_final_only:
+                    filtered_df = filtered_df[filtered_df['UID_FINAL'].notna()]
+                
+                if show_conflicts_only:
+                    # Show UIDs that have multiple questions
+                    uid_counts = filtered_df['UID'].value_counts()
+                    conflict_uids = uid_counts[uid_counts > 1].index
+                    filtered_df = filtered_df[filtered_df['UID'].isin(conflict_uids)]
+                
+                # Display results
+                st.markdown(f"#### 📋 Enhanced Question Bank ({len(filtered_df):,} records)")
+                
+                if not filtered_df.empty:
+                    # Sort by UID, then by authority count
+                    display_df = filtered_df.sort_values(['UID', 'AUTHORITY_COUNT'], ascending=[True, False])
                     
-                    # Define column config properly
-                    unique_table_column_config = {
+                    # Prepare columns for display
+                    display_columns = ['UID', 'HEADING_0', 'AUTHORITY_COUNT']
+                    if 'UID_FINAL' in display_df.columns:
+                        display_columns.append('UID_FINAL')
+                    
+                    # Define column config for main table
+                    main_column_config = {
                         "UID": st.column_config.NumberColumn("UID", width="small"),
-                        "UID_FINAL": st.column_config.NumberColumn("UID Final", width="medium"),
                         "HEADING_0": st.column_config.TextColumn("Question Text", width="large"),
                         "AUTHORITY_COUNT": st.column_config.NumberColumn("Authority Count", width="medium"),
-                        "SOURCE": st.column_config.TextColumn("Source", width="medium")
+                        "UID_FINAL": st.column_config.NumberColumn("UID Final", width="medium")
                     }
                     
                     st.dataframe(
-                        st.session_state.unique_uid_table,
-                        column_config=unique_table_column_config,
+                        display_df[display_columns],
+                        column_config=main_column_config,
                         use_container_width=True,
-                        height=300
+                        height=500
                     )
+                    
+                    # Download option
+                    csv_data = display_df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Enhanced Question Bank",
+                        csv_data,
+                        f"enhanced_question_bank_filtered_{uuid4().hex[:8]}.csv",
+                        "text/csv"
+                    )
+                    
+                    # Analysis section
+                    st.markdown("#### 📊 Analysis")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # UID Final analysis
+                        if 'UID_FINAL' in display_df.columns:
+                            st.markdown("**🎯 UID Final Analysis**")
+                            uid_final_stats = display_df.groupby('UID_FINAL').size().sort_values(ascending=False).head(10)
+                            if not uid_final_stats.empty:
+                                st.write("Top 10 UID Final values:")
+                                for uid_final, count in uid_final_stats.items():
+                                    if pd.notna(uid_final):
+                                        st.write(f"• UID Final {int(uid_final)}: {count} questions")
+                    
+                    with col2:
+                        # Conflict analysis
+                        if len(display_df) > display_df['UID'].nunique():
+                            st.markdown("**⚠️ UID Conflicts**")
+                            conflict_uids = display_df.groupby('UID').size()
+                            conflict_uids = conflict_uids[conflict_uids > 1].sort_values(ascending=False).head(5)
+                            
+                            if not conflict_uids.empty:
+                                st.write("Top 5 conflicted UIDs:")
+                                for uid, count in conflict_uids.items():
+                                    st.write(f"• UID {uid}: {count} questions")
+                                    
+                                    # Show example conflicts
+                                    examples = display_df[display_df['UID'] == uid]['HEADING_0'].head(2).tolist()
+                                    for example in examples:
+                                        st.write(f"  - {example[:80]}...")
+                else:
+                    st.info("ℹ️ No questions match the selected filters")
             else:
                 st.warning("⚠️ No question bank data available from Snowflake")
         
@@ -2753,23 +2835,35 @@ elif st.session_state.page == "uid_matching":
     # Run UID Matching
     if st.session_state.df_final is None or st.button("🚀 Run UID Matching", type="primary"):
         try:
-            with st.spinner("🔄 Running optimized UID matching (TF-IDF + Batch Semantic)..."):
+            with st.spinner("🔄 Running optimized UID matching (using simple question bank for speed)..."):
+                # Use simple question bank for faster matching
                 if st.session_state.question_bank is not None and not st.session_state.question_bank.empty:
                     # Show optimization info
-                    st.info("⚡ **Performance Optimized:** Using pre-computed embeddings and batch processing for faster matching")
+                    st.info("⚡ **Performance Optimized:** Using simple question bank (HEADING_0 → UID) for faster matching instead of enhanced version")
                     
                     # Create progress placeholder
                     progress_placeholder = st.empty()
-                    progress_placeholder.write("📊 Phase 1: TF-IDF similarity calculation...")
+                    progress_placeholder.write("📊 Phase 1: TF-IDF similarity calculation with simple question bank...")
                     
+                    # Use the simple question bank for matching (faster)
                     st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
                     
                     progress_placeholder.write("✅ Matching completed successfully!")
                     time.sleep(1)
                     progress_placeholder.empty()
                 else:
-                    st.session_state.df_final = st.session_state.df_target.copy()
-                    st.session_state.df_final["Final_UID"] = None
+                    st.warning("⚠️ Simple question bank not available. Loading basic version...")
+                    try:
+                        # Load simple question bank if not available
+                        st.session_state.question_bank = run_snowflake_reference_query()
+                        if not st.session_state.question_bank.empty:
+                            st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
+                        else:
+                            st.session_state.df_final = st.session_state.df_target.copy()
+                            st.session_state.df_final["Final_UID"] = None
+                    except Exception as e:
+                        st.session_state.df_final = st.session_state.df_target.copy()
+                        st.session_state.df_final["Final_UID"] = None
         except Exception as e:
             st.markdown('<div class="warning-card">⚠️ UID matching failed. Continuing without UIDs.</div>', unsafe_allow_html=True)
             st.session_state.df_final = st.session_state.df_target.copy()
@@ -3045,6 +3139,9 @@ with footer_col2:
     st.write("📊 SurveyMonkey: Surveys & Questions + IDs")
     st.write("❄️ Snowflake: UIDs & References")
     st.write("🎯 UID Final: Reference mappings")
+    st.markdown("**🔧 Question Banks:**")
+    st.write("• Simple QB: Used for UID matching (faster)")
+    st.write("• Enhanced QB: Used for display/analysis")
 
 with footer_col3:
     st.markdown("**📊 Current Session**")
