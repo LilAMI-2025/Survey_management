@@ -1929,7 +1929,13 @@ def prepare_export_data_improved(df_final):
         
         # Add identity classification
         df_final['is_identity'] = df_final['question_text'].apply(contains_identity_info)
-        df_final['identity_type'] = df_final['question_text'].apply(determine_identity_type)
+        df_final['identity_type'] = df_final.apply(
+            lambda row: determine_identity_type_improved(
+                row['question_text'], 
+                row.get('survey_id'), 
+                row.get('question_uid')
+            ), axis=1
+        )
         
         # Split into identity and non-identity questions
         identity_questions = df_final[df_final['is_identity'] == True].copy()
@@ -3032,6 +3038,244 @@ def determine_identity_type_improved(text, survey_id=None, question_id=None):
         return 'English Proficiency'
     else:
         return 'Other'
+
+# ============= UID MATCHING PAGE =============
+elif st.session_state.page == "uid_matching":
+    st.markdown("## 🔧 UID Matching & Configuration")
+    st.markdown('<div class="data-source-info">🔄 <strong>Process:</strong> Match survey questions → Snowflake references → Assign UIDs</div>', unsafe_allow_html=True)
+    
+    if st.session_state.df_target is None or st.session_state.df_target.empty:
+        st.markdown('<div class="warning-card">⚠️ No survey data selected. Please select surveys first.</div>', unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📋 Go to Survey Selection"):
+                st.session_state.page = "survey_selection"
+                st.rerun()
+        with col2:
+            if st.button("📊 Go to AMI Categories"):
+                st.session_state.page = "survey_categorization"
+                st.rerun()
+        st.stop()
+    
+    # Show survey data info - UPDATED to show headings instead of total questions
+    st.markdown("### 📊 Current Survey Data")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        # Count headings instead of total questions  
+        headings_count = len(st.session_state.df_target[st.session_state.df_target.get("question_category", "") == "Heading"])
+        st.metric("📑 Headings", headings_count)
+    with col2:
+        main_q = len(st.session_state.df_target[st.session_state.df_target["is_choice"] == False])
+        st.metric("Main Questions", main_q)
+    with col3:
+        if 'survey_id' in st.session_state.df_target.columns:
+            surveys = st.session_state.df_target["survey_id"].nunique()
+            st.metric("Surveys", surveys)
+        else:
+            st.metric("Surveys", "N/A")
+    
+    # Run UID Matching
+    if st.session_state.df_final is None or st.button("🚀 Run UID Matching", type="primary"):
+        try:
+            with st.spinner("🔄 Running optimized UID matching..."):
+                # Use simple question bank for faster matching
+                if st.session_state.question_bank is not None and not st.session_state.question_bank.empty:
+                    st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
+                else:
+                    st.warning("⚠️ Question bank not available. Loading...")
+                    try:
+                        st.session_state.question_bank = run_snowflake_reference_query()
+                        if not st.session_state.question_bank.empty:
+                            st.session_state.df_final = run_uid_match(st.session_state.question_bank, st.session_state.df_target)
+                        else:
+                            st.session_state.df_final = st.session_state.df_target.copy()
+                            st.session_state.df_final["Final_UID"] = None
+                    except Exception as e:
+                        st.session_state.df_final = st.session_state.df_target.copy()
+                        st.session_state.df_final["Final_UID"] = None
+        except Exception as e:
+            st.markdown('<div class="warning-card">⚠️ UID matching failed. Continuing without UIDs.</div>', unsafe_allow_html=True)
+            st.session_state.df_final = st.session_state.df_target.copy()
+            st.session_state.df_final["Final_UID"] = None
+
+    if st.session_state.df_final is not None:
+        # Matching Results - UPDATED metrics
+        matched_percentage = calculate_matched_percentage(st.session_state.df_final)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric("🎯 Match Rate", f"{matched_percentage}%")
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            high_conf = len(st.session_state.df_final[st.session_state.df_final.get("Match_Confidence", "") == "✅ High"])
+            st.metric("✅ High Confidence", high_conf)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            low_conf = len(st.session_state.df_final[st.session_state.df_final.get("Match_Confidence", "") == "⚠️ Low"])
+            st.metric("⚠️ Low Confidence", low_conf)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            # Calculate no match based on selected surveys only (main questions without UIDs)
+            main_questions_df = st.session_state.df_final[st.session_state.df_final["is_choice"] == False]
+            no_match = len(main_questions_df[main_questions_df.get("Final_UID", pd.Series()).isna()])
+            st.metric("❌ No Match", no_match)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        st.markdown("### 🔍 UID Matching Results")
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            show_main_only = st.checkbox("Show main questions only", value=True)
+        with col2:
+            match_filter = st.multiselect(
+                "Filter by match status:",
+                ["✅ High", "⚠️ Low", "🧠 Semantic", "❌ No match"],
+                default=["✅ High", "⚠️ Low", "🧠 Semantic"]
+            )
+        with col3:
+            schema_filter = st.multiselect(
+                "Filter by question type:",
+                ["Single Choice", "Multiple Choice", "Open-Ended", "Matrix"],
+                default=["Single Choice", "Multiple Choice", "Open-Ended", "Matrix"]
+            )
+        
+        # Search
+        search_query = st.text_input("🔍 Search questions/choices:")
+        
+        # Apply filters
+        result_df = st.session_state.df_final.copy()
+        if search_query:
+            result_df = result_df[result_df["question_text"].str.contains(search_query, case=False, na=False)]
+        if match_filter and "Final_Match_Type" in result_df.columns:
+            result_df = result_df[result_df["Final_Match_Type"].isin(match_filter)]
+        if show_main_only:
+            result_df = result_df[result_df["is_choice"] == False]
+        if schema_filter:
+            result_df = result_df[result_df["schema_type"].isin(schema_filter)]
+        
+        # Configure UIDs
+        if not result_df.empty:
+            uid_options = [None]
+            if st.session_state.question_bank is not None:
+                uid_options.extend([f"{row['UID']} - {row['HEADING_0']}" for _, row in st.session_state.question_bank.iterrows()])
+            
+            # Create required column if it doesn't exist
+            if "required" not in result_df.columns:
+                result_df["required"] = False
+            
+            display_columns = ["question_uid", "question_text", "schema_type", "is_choice"]
+            if "Final_UID" in result_df.columns:
+                display_columns.append("Final_UID")
+            if "Change_UID" not in result_df.columns:
+                result_df["Change_UID"] = None
+            display_columns.append("Change_UID")
+            display_columns.append("required")
+            
+            # Only show columns that exist
+            available_columns = [col for col in display_columns if col in result_df.columns]
+            
+            edited_df = st.data_editor(
+                result_df[available_columns],
+                column_config={
+                    "question_uid": st.column_config.TextColumn("Question ID", width="medium"),
+                    "question_text": st.column_config.TextColumn("Question/Choice", width="large"),
+                    "schema_type": st.column_config.TextColumn("Type", width="medium"),
+                    "is_choice": st.column_config.CheckboxColumn("Is Choice", width="small"),
+                    "Final_UID": st.column_config.TextColumn("Current UID", width="medium"),
+                    "Change_UID": st.column_config.SelectboxColumn(
+                        "Change UID",
+                        options=uid_options,
+                        default=None,
+                        width="large"
+                    ),
+                    "required": st.column_config.CheckboxColumn("Required", width="small")
+                },
+                disabled=["question_uid", "question_text", "schema_type", "is_choice", "Final_UID"],
+                hide_index=True,
+                height=400
+            )
+            
+            # Apply UID changes
+            for idx, row in edited_df.iterrows():
+                if pd.notnull(row.get("Change_UID")):
+                    new_uid = row["Change_UID"].split(" - ")[0]
+                    st.session_state.df_final.at[idx, "Final_UID"] = new_uid
+                    st.session_state.df_final.at[idx, "configured_final_UID"] = new_uid
+                    st.session_state.uid_changes[idx] = new_uid
+        
+        # Export Section
+        st.markdown("---")
+        st.markdown("### 📥 Export & Upload")
+        
+        # Prepare export data - now uses the IMPROVED function
+        export_df_non_identity, export_df_identity = prepare_export_data_improved(st.session_state.df_final)
+        
+        if not export_df_non_identity.empty or not export_df_identity.empty:
+            
+            # Show metrics for both tables
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📊 Non-Identity Questions", len(export_df_non_identity))
+            with col2:
+                st.metric("🔐 Identity Questions", len(export_df_identity))
+            with col3:
+                total_records = len(export_df_non_identity) + len(export_df_identity)
+                st.metric("📋 Total Records", total_records)
+            
+            # Preview both tables
+            st.markdown("#### 👁️ Preview Data for Export")
+            
+            # Non-Identity Questions Preview
+            if not export_df_non_identity.empty:
+                st.markdown("**📊 Non-Identity Questions (Table 1)**")
+                st.dataframe(export_df_non_identity.head(10), use_container_width=True)
+            
+            # Identity Questions Preview - NOW with question_number and UID columns
+            if not export_df_identity.empty:
+                st.markdown("**🔐 Identity Questions (Table 2) - Updated with Question Number & UID**")
+                st.dataframe(export_df_identity.head(10), use_container_width=True)
+            
+            # Download options
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if not export_df_non_identity.empty:
+                    csv_data_non_identity = export_df_non_identity.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Non-Identity CSV",
+                        csv_data_non_identity,
+                        f"non_identity_questions_{uuid4().hex[:8]}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+            
+            with col2:
+                if not export_df_identity.empty:
+                    csv_data_identity = export_df_identity.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Identity CSV", 
+                        csv_data_identity,
+                        f"identity_questions_{uuid4().hex[:8]}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+            
+            with col3:
+                if st.button("🚀 Upload Both Tables to Snowflake", use_container_width=True):
+                    upload_to_snowflake_tables(export_df_non_identity, export_df_identity)
+
+        else:
+            st.warning("⚠️ No data available for export")
+
+# ============= SURVEY CREATION PAGE =============
 
 
 
