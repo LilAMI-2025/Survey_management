@@ -1690,110 +1690,110 @@ def precompute_reference_embeddings(question_bank):
         logger.error(f"Failed to precompute reference embeddings: {e}")
         return None
 
-def run_uid_match_optimized(question_bank, df_target):
-    """Optimized UID matching algorithm with pre-computed embeddings and batch processing"""
-    try:
-        # Prepare question bank with normalized text
-        question_bank_norm = question_bank.copy()
-        question_bank_norm["norm_text"] = question_bank_norm["HEADING_0"].apply(enhanced_normalize)
-        
-        # Prepare target questions
-        df_target_norm = df_target.copy()
-        df_target_norm["norm_text"] = df_target_norm["question_text"].apply(enhanced_normalize)
-        
-        # Get TF-IDF vectors (cached)
-        vectorizer, reference_vectors = get_tfidf_vectors(question_bank_norm)
-        
-        # Pre-compute semantic embeddings (cached)
-        reference_embeddings = precompute_reference_embeddings(question_bank_norm)
-        
-        # Initialize results
-        df_target_norm["Final_UID"] = None
-        df_target_norm["Match_Confidence"] = None
-        df_target_norm["Final_Match_Type"] = None
-        
-        # Load sentence transformer for batch processing
-        model = load_sentence_transformer()
-        
-        # Process all questions at once for TF-IDF
-        target_vectors = vectorizer.transform(df_target_norm["norm_text"])
-        tfidf_similarities = cosine_similarity(target_vectors, reference_vectors)
-        
-        # Batch process semantic matching for questions that need it
-        semantic_needed_indices = []
-        semantic_questions = []
-        
-        # First pass: TF-IDF matching
-        for i, (idx, row) in enumerate(df_target_norm.iterrows()):
-            tfidf_scores = tfidf_similarities[i]
-            max_tfidf_idx = np.argmax(tfidf_scores)
-            max_tfidf_score = tfidf_scores[max_tfidf_idx]
-            
-            if max_tfidf_score >= TFIDF_HIGH_CONFIDENCE:
-                matched_uid = question_bank_norm.iloc[max_tfidf_idx]["UID"]
-                df_target_norm.at[idx, "Final_UID"] = matched_uid
-                df_target_norm.at[idx, "Match_Confidence"] = "✅ High"
-                df_target_norm.at[idx, "Final_Match_Type"] = "✅ High"
-            elif max_tfidf_score >= TFIDF_LOW_CONFIDENCE:
-                matched_uid = question_bank_norm.iloc[max_tfidf_idx]["UID"]
-                df_target_norm.at[idx, "Final_UID"] = matched_uid
-                df_target_norm.at[idx, "Match_Confidence"] = "⚠️ Low"
-                df_target_norm.at[idx, "Final_Match_Type"] = "⚠️ Low"
-            else:
-                # Mark for semantic matching
-                semantic_needed_indices.append((i, idx))
-                semantic_questions.append(row["question_text"])
-        
-        # Batch semantic matching for remaining questions
-        if semantic_questions and reference_embeddings is not None:
-            try:
-                # Encode all unmatched questions at once
-                target_embeddings = model.encode(semantic_questions, convert_to_tensor=True, batch_size=32)
-                
-                # Calculate similarities in batch
-                semantic_similarities = util.cos_sim(target_embeddings, reference_embeddings)
-                
-                # Process semantic results
-                for batch_idx, (original_idx, df_idx) in enumerate(semantic_needed_indices):
-                    semantic_scores = semantic_similarities[batch_idx]
-                    max_semantic_score = max(semantic_scores).item()
-                    
-                    if max_semantic_score >= SEMANTIC_THRESHOLD:
-                        max_semantic_idx = semantic_scores.argmax().item()
-                        matched_uid = question_bank_norm.iloc[max_semantic_idx]["UID"]
-                        df_target_norm.at[df_idx, "Final_UID"] = matched_uid
-                        df_target_norm.at[df_idx, "Match_Confidence"] = "🧠 Semantic"
-                        df_target_norm.at[df_idx, "Final_Match_Type"] = "🧠 Semantic"
-                    else:
-                        df_target_norm.at[df_idx, "Final_UID"] = None
-                        df_target_norm.at[df_idx, "Match_Confidence"] = "❌ No match"
-                        df_target_norm.at[df_idx, "Final_Match_Type"] = "❌ No match"
-            except Exception as e:
-                logger.error(f"Batch semantic matching failed: {e}")
-                # Fallback to no match for remaining questions
-                for _, df_idx in semantic_needed_indices:
-                    df_target_norm.at[df_idx, "Final_UID"] = None
-                    df_target_norm.at[df_idx, "Match_Confidence"] = "❌ No match"
-                    df_target_norm.at[df_idx, "Final_Match_Type"] = "❌ No match"
+@st.cache_data(ttl=3600)
+def compute_tfidf_matches(df_reference, df_target, synonym_map=ENHANCED_SYNONYM_MAP):
+    """Compute TF-IDF based matches between reference and target questions"""
+    # df_reference has HEADING_0 (Snowflake), df_target has question_text (SurveyMonkey)
+    df_reference = df_reference[df_reference["HEADING_0"].notna()].reset_index(drop=True)
+    df_target = df_target[df_target["question_text"].notna()].reset_index(drop=True)
+    df_reference["norm_text"] = df_reference["HEADING_0"].apply(enhanced_normalize)
+    df_target["norm_text"] = df_target["question_text"].apply(enhanced_normalize)
+
+    vectorizer, ref_vectors = get_tfidf_vectors(df_reference)
+    target_vectors = vectorizer.transform(df_target["norm_text"])
+    similarity_matrix = cosine_similarity(target_vectors, ref_vectors)
+
+    matched_uids, matched_qs, scores, confs = [], [], [], []
+    for sim_row in similarity_matrix:
+        best_idx = sim_row.argmax()
+        best_score = sim_row[best_idx]
+        if best_score >= TFIDF_HIGH_CONFIDENCE:
+            conf = "✅ High"
+        elif best_score >= TFIDF_LOW_CONFIDENCE:
+            conf = "⚠️ Low"
         else:
-            # No semantic matching possible, mark remaining as no match
-            for _, df_idx in semantic_needed_indices:
-                df_target_norm.at[df_idx, "Final_UID"] = None
-                df_target_norm.at[df_idx, "Match_Confidence"] = "❌ No match"
-                df_target_norm.at[df_idx, "Final_Match_Type"] = "❌ No match"
-        
-        # Remove normalization column before returning
-        df_target_norm = df_target_norm.drop(columns=["norm_text"])
-        
-        return df_target_norm
-        
-    except Exception as e:
-        logger.error(f"UID matching failed: {e}")
-        # Return original dataframe with empty UID columns
-        df_target["Final_UID"] = None
-        df_target["Match_Confidence"] = "❌ Error"
-        df_target["Final_Match_Type"] = "❌ Error"
-        return df_target
+            conf = "❌ No match"
+            best_idx = None
+        matched_uids.append(df_reference.iloc[best_idx]["UID"] if best_idx is not None else None)
+        matched_qs.append(df_reference.iloc[best_idx]["HEADING_0"] if best_idx is not None else None)
+        scores.append(round(best_score, 4))
+        confs.append(conf)
+
+    df_target["Suggested_UID"] = matched_uids
+    df_target["Matched_Question"] = matched_qs
+    df_target["Similarity"] = scores
+    df_target["Match_Confidence"] = confs
+    return df_target
+
+def compute_semantic_matches(df_reference, df_target):
+    """Compute semantic similarity matches using SentenceTransformer"""
+    model = load_sentence_transformer()
+    # df_target has question_text, df_reference has HEADING_0
+    emb_target = model.encode(df_target["question_text"].tolist(), convert_to_tensor=True)
+    emb_ref = model.encode(df_reference["HEADING_0"].tolist(), convert_to_tensor=True)
+    cosine_scores = util.cos_sim(emb_target, emb_ref)
+
+    sem_matches, sem_scores = [], []
+    for i in range(len(df_target)):
+        best_idx = cosine_scores[i].argmax().item()
+        score = cosine_scores[i][best_idx].item()
+        sem_matches.append(df_reference.iloc[best_idx]["UID"] if score >= SEMANTIC_THRESHOLD else None)
+        sem_scores.append(round(score, 4) if score >= SEMANTIC_THRESHOLD else None)
+
+    df_target["Semantic_UID"] = sem_matches
+    df_target["Semantic_Similarity"] = sem_scores
+    return df_target
+
+def assign_match_type(row):
+    """Assign final match type based on TF-IDF and semantic results"""
+    if pd.notnull(row["Suggested_UID"]):
+        return row["Match_Confidence"]
+    return "🧠 Semantic" if pd.notnull(row["Semantic_UID"]) else "❌ No match"
+
+def finalize_matches(df_target, df_reference):
+    """Finalize UID matches and create change options"""
+    df_target["Final_UID"] = df_target["Suggested_UID"].combine_first(df_target["Semantic_UID"])
+    df_target["configured_final_UID"] = df_target["Final_UID"]
+    df_target["Final_Question"] = df_target["Matched_Question"]
+    df_target["Final_Match_Type"] = df_target.apply(assign_match_type, axis=1)
+    
+    # Prevent UID assignment for Heading questions
+    if "question_category" in df_target.columns:
+        df_target.loc[df_target["question_category"] == "Heading", ["Final_UID", "configured_final_UID"]] = None
+    
+    df_target["Change_UID"] = df_target["Final_UID"].apply(
+        lambda x: f"{x} - {df_reference[df_reference['UID'] == x]['HEADING_0'].iloc[0]}" if pd.notnull(x) and x in df_reference["UID"].values else None
+    )
+    
+    return df_target
+
+def detect_uid_conflicts(df_target):
+    """Detect UID conflicts where multiple questions have the same UID"""
+    uid_conflicts = df_target.groupby("Final_UID")["question_text"].nunique()
+    duplicate_uids = uid_conflicts[uid_conflicts > 1].index
+    df_target["UID_Conflict"] = df_target["Final_UID"].apply(
+        lambda x: "⚠️ Conflict" if pd.notnull(x) and x in duplicate_uids else ""
+    )
+    return df_target
+
+def run_uid_match_optimized(question_bank, df_target):
+    """Improved UID matching with TF-IDF + Semantic matching"""
+    if question_bank.empty or df_target.empty:
+        st.error("Input data is empty.")
+        return pd.DataFrame()
+
+    df_results = []
+    batch_size = BATCH_SIZE
+    for start in range(0, len(df_target), batch_size):
+        batch_target = df_target.iloc[start:start + batch_size].copy()
+        with st.spinner(f"Processing batch {start//batch_size + 1}..."):
+            batch_target = compute_tfidf_matches(question_bank, batch_target)
+            batch_target = compute_semantic_matches(question_bank, batch_target)
+            batch_target = finalize_matches(batch_target, question_bank)
+            batch_target = detect_uid_conflicts(batch_target)
+        df_results.append(batch_target)
+    
+    return pd.concat(df_results, ignore_index=True) if df_results else pd.DataFrame()
 
 # Update the original function to use the optimized version
 def run_uid_match(question_bank, df_target):
@@ -1807,35 +1807,31 @@ def prepare_export_data(df_final):
         if df_final is None or df_final.empty:
             return pd.DataFrame(), pd.DataFrame()
         
-        # Filter for main questions only (not choices)
-        main_questions = df_final[df_final["is_choice"] == False].copy()
-        
-        if main_questions.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        
         # Add identity classification
-        main_questions['is_identity'] = main_questions['question_text'].apply(contains_identity_info)
-        main_questions['identity_type'] = main_questions['question_text'].apply(determine_identity_type)
+        df_final['is_identity'] = df_final['question_text'].apply(contains_identity_info)
+        df_final['identity_type'] = df_final['question_text'].apply(determine_identity_type)
         
         # Split into identity and non-identity questions
-        identity_questions = main_questions[main_questions['is_identity'] == True].copy()
-        non_identity_questions = main_questions[main_questions['is_identity'] == False].copy()
+        identity_questions = df_final[df_final['is_identity'] == True].copy()
+        non_identity_questions = df_final[df_final['is_identity'] == False].copy()
         
         # Prepare non-identity export (Table 1)
         export_df_non_identity = pd.DataFrame()
         if not non_identity_questions.empty:
             export_df_non_identity = non_identity_questions[[
-                'question_uid', 'question_text', 'schema_type', 'Final_UID', 'required'
+                'survey_id', 'question_uid', 'position', 'Final_UID'
             ]].copy()
-            export_df_non_identity.columns = ['question_id', 'question_text', 'question_type', 'UID', 'required']
+            export_df_non_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'QUESTION_NUMBER', 'UID']
         
         # Prepare identity export (Table 2)
         export_df_identity = pd.DataFrame()
         if not identity_questions.empty:
+            # Add ROWS_ID for identity questions
+            identity_questions['ROWS_ID'] = range(1000000000, 1000000000 + len(identity_questions))
             export_df_identity = identity_questions[[
-                'question_uid', 'question_text', 'schema_type', 'identity_type', 'Final_UID', 'required'
+                'survey_id', 'question_uid', 'ROWS_ID', 'identity_type'
             ]].copy()
-            export_df_identity.columns = ['question_id', 'question_text', 'question_type', 'identity_type', 'UID', 'required']
+            export_df_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'ROWS_ID', 'IDENTITY_TYPE']
         
         return export_df_non_identity, export_df_identity
         
@@ -1847,37 +1843,44 @@ def upload_to_snowflake_tables(export_df_non_identity, export_df_identity):
     """Upload both export tables to Snowflake"""
     try:
         engine = get_snowflake_engine()
+        success_count = 0
         
         with st.spinner("🚀 Uploading tables to Snowflake..."):
-            # Upload non-identity questions
-            if not export_df_non_identity.empty:
-                table_name_1 = f"uid_matcher_non_identity_{uuid4().hex[:8]}"
-                export_df_non_identity.to_sql(
-                    table_name_1, 
-                    engine, 
-                    if_exists='replace', 
-                    index=False,
-                    method='multi'
-                )
-                st.success(f"✅ Non-identity questions uploaded to: {table_name_1}")
-            
-            # Upload identity questions
-            if not export_df_identity.empty:
-                table_name_2 = f"uid_matcher_identity_{uuid4().hex[:8]}"
-                export_df_identity.to_sql(
-                    table_name_2, 
-                    engine, 
-                    if_exists='replace', 
-                    index=False,
-                    method='multi'
-                )
-                st.success(f"✅ Identity questions uploaded to: {table_name_2}")
-            
-            st.success("🎉 Both tables uploaded successfully to Snowflake!")
+            with engine.connect() as conn:
+                # Upload non-identity questions
+                if not export_df_non_identity.empty:
+                    export_df_non_identity.to_sql(
+                        'SURVEY_QUESTIONS_NON_IDENTITY',
+                        conn,
+                        schema='DBT_SURVEY_MONKEY',
+                        if_exists='append',
+                        index=False
+                    )
+                    success_count += len(export_df_non_identity)
+                    st.success(f"✅ Uploaded {len(export_df_non_identity)} non-identity records!")
+                
+                # Upload identity questions
+                if not export_df_identity.empty:
+                    export_df_identity.to_sql(
+                        'SURVEY_QUESTIONS_IDENTITY',
+                        conn,
+                        schema='DBT_SURVEY_MONKEY',
+                        if_exists='append',
+                        index=False
+                    )
+                    success_count += len(export_df_identity)
+                    st.success(f"✅ Uploaded {len(export_df_identity)} identity records!")
+        
+        st.success(f"🎉 Total upload successful: {success_count} records to Snowflake!")
+        return True
         
     except Exception as e:
-        logger.error(f"Failed to upload to Snowflake: {e}")
-        st.error(f"❌ Failed to upload to Snowflake: {str(e)}")
+        logger.error(f"Snowflake upload failed: {e}")
+        if "250001" in str(e):
+            st.error("❌ Snowflake upload failed: User account is locked. Contact your Snowflake admin.")
+        else:
+            st.error(f"❌ Snowflake upload failed: {str(e)}")
+        return False
 
 # ============= MAIN APPLICATION INITIALIZATION =============
 # Initialize session state
