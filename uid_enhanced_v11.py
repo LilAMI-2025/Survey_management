@@ -19,7 +19,6 @@ from sentence_transformers import SentenceTransformer, util
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from collections import defaultdict, Counter
 from datetime import datetime, date
-from fuzzywuzzy import fuzz
 from difflib import SequenceMatcher
 
 # ============= STREAMLIT CONFIGURATION =============
@@ -338,7 +337,7 @@ def get_enhanced_surveys():
     return get_enhanced_surveys_from_2023()
 
 def compute_question_similarity(text1, text2):
-    """Compute similarity between two questions using multiple methods"""
+    """Compute similarity between two questions using difflib"""
     if not text1 or not text2:
         return 0.0
     
@@ -346,16 +345,10 @@ def compute_question_similarity(text1, text2):
     norm_text1 = enhanced_normalize_text(text1).lower()
     norm_text2 = enhanced_normalize_text(text2).lower()
     
-    # Fuzzy ratio
-    fuzzy_score = fuzz.ratio(norm_text1, norm_text2) / 100.0
+    # Use SequenceMatcher for similarity (built-in Python)
+    similarity = SequenceMatcher(None, norm_text1, norm_text2).ratio()
     
-    # Sequence matcher
-    seq_score = SequenceMatcher(None, norm_text1, norm_text2).ratio()
-    
-    # Combine scores (weighted average)
-    combined_score = (fuzzy_score * 0.6) + (seq_score * 0.4)
-    
-    return combined_score
+    return similarity
 
 @st.cache_data(ttl=3600)
 def compute_semantic_similarities(questions_list):
@@ -404,7 +397,8 @@ def deduplicate_main_questions(main_questions_df):
     
     # Find duplicates
     duplicates_to_remove = set()
-    SIMILARITY_THRESHOLD = 0.85  # High threshold for main questions
+    SEMANTIC_SIMILARITY_THRESHOLD = 0.85  # High threshold for semantic similarity
+    TEXT_SIMILARITY_THRESHOLD = 0.80  # Adjusted threshold for text similarity
     
     for i in range(len(questions_list)):
         if i in duplicates_to_remove:
@@ -417,11 +411,11 @@ def deduplicate_main_questions(main_questions_df):
             # Check semantic similarity
             semantic_sim = semantic_matrix[i][j] if semantic_matrix.size > 0 else 0
             
-            # Check fuzzy similarity
-            fuzzy_sim = compute_question_similarity(questions_list[i], questions_list[j])
+            # Check text similarity using difflib
+            text_sim = compute_question_similarity(questions_list[i], questions_list[j])
             
-            # Combined decision
-            if semantic_sim > SIMILARITY_THRESHOLD or fuzzy_sim > SIMILARITY_THRESHOLD:
+            # Combined decision - either high semantic OR high text similarity
+            if semantic_sim > SEMANTIC_SIMILARITY_THRESHOLD or text_sim > TEXT_SIMILARITY_THRESHOLD:
                 # Keep the higher quality question
                 if main_questions_df.iloc[i]["quality_score"] >= main_questions_df.iloc[j]["quality_score"]:
                     duplicates_to_remove.add(j)
@@ -443,7 +437,7 @@ def deduplicate_choices(choices_df):
     
     # Group choices by normalized choice text
     choice_groups = {}
-    CHOICE_SIMILARITY_THRESHOLD = 0.90  # Higher threshold for choices
+    CHOICE_SIMILARITY_THRESHOLD = 0.85  # Adjusted threshold for choices using difflib
     
     for idx, row in choices_df.iterrows():
         choice_text = row["choice_text"]
