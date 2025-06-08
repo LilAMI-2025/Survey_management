@@ -18,6 +18,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer, util
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from collections import defaultdict, Counter
+from datetime import datetime, date
+from fuzzywuzzy import fuzz
+from difflib import SequenceMatcher
 
 # ============= STREAMLIT CONFIGURATION =============
 st.set_page_config(
@@ -284,22 +287,197 @@ def get_enhanced_surveymonkey_token():
         return None
 
 @st.cache_data(ttl=1800)
-def get_enhanced_surveys():
-    """Get surveys with enhanced caching"""
+def get_enhanced_surveys_from_2023():
+    """Get surveys from 2023 onwards with enhanced filtering"""
     token = get_enhanced_surveymonkey_token()
     if not token:
         return []
     
     try:
         headers = {"Authorization": f"Bearer {token}"}
-        response = requests.get("https://api.surveymonkey.com/v3/surveys", headers=headers)
+        
+        # Get surveys with date filtering
+        params = {
+            "per_page": 1000,  # Get more surveys at once
+            "sort_order": "DESC",
+            "sort_by": "date_created"
+        }
+        
+        response = requests.get("https://api.surveymonkey.com/v3/surveys", 
+                              headers=headers, params=params)
         response.raise_for_status()
-        surveys = response.json().get("data", [])
-        logger.info(f"Retrieved {len(surveys)} surveys from SurveyMonkey")
-        return surveys
+        all_surveys = response.json().get("data", [])
+        
+        # Filter surveys from 2023 onwards
+        filtered_surveys = []
+        cutoff_date = datetime(2023, 1, 1)
+        
+        for survey in all_surveys:
+            date_created = survey.get("date_created")
+            if date_created:
+                try:
+                    # Parse SurveyMonkey date format
+                    survey_date = datetime.strptime(date_created, "%Y-%m-%dT%H:%M:%S")
+                    if survey_date >= cutoff_date:
+                        filtered_surveys.append(survey)
+                except ValueError:
+                    # If date parsing fails, include the survey to be safe
+                    filtered_surveys.append(survey)
+        
+        logger.info(f"Retrieved {len(filtered_surveys)} surveys from 2023+ (out of {len(all_surveys)} total)")
+        return filtered_surveys
+        
     except Exception as e:
-        logger.error(f"Failed to get surveys: {e}")
+        logger.error(f"Failed to get surveys from 2023+: {e}")
         return []
+
+# Backwards compatibility
+@st.cache_data(ttl=1800)
+def get_enhanced_surveys():
+    """Backwards compatibility - calls get_enhanced_surveys_from_2023"""
+    return get_enhanced_surveys_from_2023()
+
+def compute_question_similarity(text1, text2):
+    """Compute similarity between two questions using multiple methods"""
+    if not text1 or not text2:
+        return 0.0
+    
+    # Normalize texts
+    norm_text1 = enhanced_normalize_text(text1).lower()
+    norm_text2 = enhanced_normalize_text(text2).lower()
+    
+    # Fuzzy ratio
+    fuzzy_score = fuzz.ratio(norm_text1, norm_text2) / 100.0
+    
+    # Sequence matcher
+    seq_score = SequenceMatcher(None, norm_text1, norm_text2).ratio()
+    
+    # Combine scores (weighted average)
+    combined_score = (fuzzy_score * 0.6) + (seq_score * 0.4)
+    
+    return combined_score
+
+@st.cache_data(ttl=3600)
+def compute_semantic_similarities(questions_list):
+    """Compute semantic similarities using sentence transformers"""
+    if not questions_list:
+        return np.array([])
+    
+    model = load_enhanced_model()
+    embeddings = model.encode(questions_list, convert_to_tensor=True)
+    similarity_matrix = util.cos_sim(embeddings, embeddings).cpu().numpy()
+    
+    return similarity_matrix
+
+def deduplicate_questions_advanced(all_questions_df):
+    """Advanced deduplication using sentence transformers and fuzzy matching"""
+    if all_questions_df.empty:
+        return all_questions_df
+    
+    st.info("🔄 Performing advanced deduplication using AI and fuzzy matching...")
+    
+    # Separate main questions and choices for different deduplication strategies
+    main_questions = all_questions_df[all_questions_df["is_choice"] == False].copy()
+    choices = all_questions_df[all_questions_df["is_choice"] == True].copy()
+    
+    # Deduplicate main questions
+    dedup_main = deduplicate_main_questions(main_questions)
+    
+    # Deduplicate choices
+    dedup_choices = deduplicate_choices(choices)
+    
+    # Combine results
+    result_df = pd.concat([dedup_main, dedup_choices], ignore_index=True)
+    
+    logger.info(f"📊 Deduplication results: {len(all_questions_df)} → {len(result_df)} questions")
+    return result_df
+
+def deduplicate_main_questions(main_questions_df):
+    """Deduplicate main questions using semantic similarity"""
+    if main_questions_df.empty:
+        return main_questions_df
+    
+    questions_list = main_questions_df["question_text"].tolist()
+    
+    # Compute semantic similarities
+    semantic_matrix = compute_semantic_similarities(questions_list)
+    
+    # Find duplicates
+    duplicates_to_remove = set()
+    SIMILARITY_THRESHOLD = 0.85  # High threshold for main questions
+    
+    for i in range(len(questions_list)):
+        if i in duplicates_to_remove:
+            continue
+            
+        for j in range(i + 1, len(questions_list)):
+            if j in duplicates_to_remove:
+                continue
+            
+            # Check semantic similarity
+            semantic_sim = semantic_matrix[i][j] if semantic_matrix.size > 0 else 0
+            
+            # Check fuzzy similarity
+            fuzzy_sim = compute_question_similarity(questions_list[i], questions_list[j])
+            
+            # Combined decision
+            if semantic_sim > SIMILARITY_THRESHOLD or fuzzy_sim > SIMILARITY_THRESHOLD:
+                # Keep the higher quality question
+                if main_questions_df.iloc[i]["quality_score"] >= main_questions_df.iloc[j]["quality_score"]:
+                    duplicates_to_remove.add(j)
+                else:
+                    duplicates_to_remove.add(i)
+                    break
+    
+    # Remove duplicates
+    indices_to_keep = [i for i in range(len(main_questions_df)) if i not in duplicates_to_remove]
+    result_df = main_questions_df.iloc[indices_to_keep].reset_index(drop=True)
+    
+    st.success(f"✅ Main questions: {len(main_questions_df)} → {len(result_df)} (removed {len(duplicates_to_remove)} duplicates)")
+    return result_df
+
+def deduplicate_choices(choices_df):
+    """Deduplicate choices with context awareness"""
+    if choices_df.empty:
+        return choices_df
+    
+    # Group choices by normalized choice text
+    choice_groups = {}
+    CHOICE_SIMILARITY_THRESHOLD = 0.90  # Higher threshold for choices
+    
+    for idx, row in choices_df.iterrows():
+        choice_text = row["choice_text"]
+        normalized_choice = enhanced_normalize_text(choice_text).lower()
+        
+        # Find similar existing choices
+        matched_group = None
+        for existing_choice in choice_groups.keys():
+            similarity = compute_question_similarity(normalized_choice, existing_choice)
+            if similarity > CHOICE_SIMILARITY_THRESHOLD:
+                matched_group = existing_choice
+                break
+        
+        if matched_group:
+            choice_groups[matched_group].append(idx)
+        else:
+            choice_groups[normalized_choice] = [idx]
+    
+    # Keep best representative from each group
+    indices_to_keep = []
+    for group_indices in choice_groups.values():
+        if len(group_indices) == 1:
+            indices_to_keep.append(group_indices[0])
+        else:
+            # Keep the choice with highest quality score
+            best_idx = max(group_indices, 
+                          key=lambda x: choices_df.iloc[x]["quality_score"])
+            indices_to_keep.append(best_idx)
+    
+    result_df = choices_df.iloc[indices_to_keep].reset_index(drop=True)
+    
+    removed_count = len(choices_df) - len(result_df)
+    st.success(f"✅ Choices: {len(choices_df)} → {len(result_df)} (removed {removed_count} duplicates)")
+    return result_df
 
 def extract_enhanced_questions(survey_json):
     """Enhanced question extraction with complete structure"""
@@ -778,7 +956,7 @@ def show_enhanced_home():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        surveys = get_enhanced_surveys()
+        surveys = get_enhanced_surveys_from_2023()
         st.metric("📊 Available Surveys", len(surveys))
     
     with col2:
@@ -822,50 +1000,42 @@ def show_enhanced_home():
             st.rerun()
 
 def show_question_bank_builder():
-    """Enhanced question bank builder page"""
+    """Enhanced question bank builder with automatic 2023+ processing and advanced deduplication"""
     st.markdown("## 📊 Enhanced Question Bank Builder")
-    st.markdown('<div class="question-bank-card">🔄 <strong>Hybrid Approach:</strong> Building comprehensive question bank from SurveyMonkey with complete structure</div>', unsafe_allow_html=True)
+    st.markdown('<div class="question-bank-card">🤖 <strong>AI-Powered Deduplication:</strong> Automatically processes all surveys from 2023+ with semantic similarity and fuzzy matching</div>', unsafe_allow_html=True)
     
-    # Get available surveys
-    surveys = get_enhanced_surveys()
-    
-    if not surveys:
-        st.warning("⚠️ No surveys available. Check SurveyMonkey connection.")
-        return
-    
-    # Survey selection
-    st.markdown("### 📋 Select Surveys for Question Bank")
-    
-    # Enhanced survey selection with filters
-    col1, col2 = st.columns(2)
+    # Information panel
+    col1, col2 = st.columns([2, 1])
     
     with col1:
-        survey_filter = st.text_input("🔍 Filter surveys by title:")
+        st.markdown("""
+        ### 🎯 **Automated Process:**
+        - ✅ **Auto-fetch** all surveys from 2023 onwards
+        - 🤖 **AI Deduplication** using sentence transformers  
+        - 🔤 **Fuzzy matching** for text similarity
+        - 📊 **Quality scoring** for best question selection
+        - 🔐 **Identity detection** with 21 types
+        """)
     
     with col2:
-        show_all = st.checkbox("Show all surveys", value=False)
+        # Show current stats if question bank exists
+        if st.session_state.question_bank_complete is not None:
+            df = st.session_state.question_bank_complete
+            st.metric("📊 Total Questions", len(df))
+            st.metric("❓ Main Questions", len(df[df["is_choice"] == False]))
+            st.metric("🔘 Choices", len(df[df["is_choice"] == True]))
     
-    # Filter surveys
-    filtered_surveys = surveys
-    if survey_filter:
-        filtered_surveys = [s for s in surveys if survey_filter.lower() in s.get('title', '').lower()]
-    
-    if not show_all:
-        filtered_surveys = filtered_surveys[:20]  # Limit for performance
-    
-    # Survey selection
-    survey_options = [f"{s['id']} - {s['title']}" for s in filtered_surveys]
-    selected_surveys = st.multiselect(
-        f"Choose surveys (showing {len(filtered_surveys)} of {len(surveys)}):",
-        survey_options,
-        default=st.session_state.get("selected_surveys_v11", [])
-    )
-    
-    st.session_state.selected_surveys_v11 = selected_surveys
-    selected_survey_ids = [s.split(" - ")[0] for s in selected_surveys]
-    
-    # Build question bank
-    if selected_survey_ids and st.button("🔨 Build Enhanced Question Bank", type="primary"):
+    # Build question bank button
+    if st.button("🚀 Build AI-Powered Question Bank", type="primary", help="Process all surveys from 2023+ with advanced deduplication"):
+        
+        # Get surveys from 2023+
+        surveys_2023 = get_enhanced_surveys_from_2023()
+        
+        if not surveys_2023:
+            st.error("❌ No surveys found from 2023 onwards or connection failed")
+            return
+        
+        st.info(f"📅 Found {len(surveys_2023)} surveys from 2023 onwards")
         
         all_questions = []
         token = get_enhanced_surveymonkey_token()
@@ -874,11 +1044,16 @@ def show_question_bank_builder():
             st.error("❌ SurveyMonkey token not available")
             return
         
+        # Progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, survey_id in enumerate(selected_survey_ids):
-            status_text.text(f"Processing survey {i+1}/{len(selected_survey_ids)}: {survey_id}")
+        # Process each survey
+        for i, survey in enumerate(surveys_2023):
+            survey_id = survey["id"]
+            survey_title = survey.get("title", "Unknown")
+            
+            status_text.text(f"🔍 Processing survey {i+1}/{len(surveys_2023)}: {survey_title[:50]}...")
             
             try:
                 # Get survey details
@@ -895,91 +1070,89 @@ def show_question_bank_builder():
                 all_questions.extend(questions)
                 
                 time.sleep(REQUEST_DELAY)
-                progress_bar.progress((i + 1) / len(selected_survey_ids))
+                progress_bar.progress((i + 1) / len(surveys_2023))
                 
             except Exception as e:
-                st.error(f"❌ Failed to process survey {survey_id}: {e}")
+                st.warning(f"⚠️ Skipped survey {survey_id}: {str(e)[:100]}")
                 continue
         
         progress_bar.empty()
         status_text.empty()
         
-        if all_questions:
-            # Create comprehensive question dataframe
-            question_bank_df = pd.DataFrame(all_questions)
-            st.session_state.question_bank_complete = question_bank_df
-            
-            st.success(f"✅ Enhanced question bank created: {len(all_questions)} total items")
-            
-            # Show statistics
-            col1, col2, col3, col4 = st.columns(4)
-            
-            main_questions = question_bank_df[question_bank_df["is_choice"] == False]
-            choices = question_bank_df[question_bank_df["is_choice"] == True]
-            identity_questions = question_bank_df[question_bank_df["is_identity"] == True]
-            high_quality = question_bank_df[question_bank_df["quality_score"] >= QUESTION_QUALITY_THRESHOLD]
-            
-            with col1:
-                st.metric("❓ Main Questions", len(main_questions))
-            with col2:
-                st.metric("🔘 Choice Options", len(choices))
-            with col3:
-                st.metric("🔐 Identity Questions", len(identity_questions))
-            with col4:
-                st.metric("⭐ High Quality", len(high_quality))
+        if not all_questions:
+            st.error("❌ No questions extracted from surveys")
+            return
+        
+        # Create initial dataframe
+        st.info(f"📊 Extracted {len(all_questions)} total questions and choices")
+        all_questions_df = pd.DataFrame(all_questions)
+        
+        # Advanced deduplication
+        dedup_df = deduplicate_questions_advanced(all_questions_df)
+        
+        # Save to session state
+        st.session_state.question_bank_complete = dedup_df
+        
+        # Success summary
+        st.success(f"✅ **Question Bank Created Successfully!**")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        main_questions = dedup_df[dedup_df["is_choice"] == False]
+        choices = dedup_df[dedup_df["is_choice"] == True]
+        identity_questions = dedup_df[dedup_df["is_identity"] == True]
+        high_quality = dedup_df[dedup_df["quality_score"] >= QUESTION_QUALITY_THRESHOLD]
+        
+        with col1:
+            st.metric("❓ Main Questions", len(main_questions))
+        with col2:
+            st.metric("🔘 Choice Options", len(choices))
+        with col3:
+            st.metric("🔐 Identity Questions", len(identity_questions))
+        with col4:
+            st.metric("⭐ High Quality", len(high_quality))
     
     # Display current question bank
     if st.session_state.question_bank_complete is not None:
         df = st.session_state.question_bank_complete
         
-        st.markdown("### 📊 Enhanced Question Bank Preview")
+        st.markdown("---")
+        st.markdown("### 📊 Question Bank Explorer")
         
-        # Filters
-        col1, col2, col3 = st.columns(3)
+        # Simple filter dropdown as requested
+        col1, col2 = st.columns([1, 2])
         
         with col1:
-            question_type_filter = st.selectbox(
-                "Question Type:",
-                ["All", "Main Questions", "Choices", "Identity Questions", "High Quality"],
-                key="qb_type_filter"
+            question_filter = st.selectbox(
+                "📋 Question Type Filter:",
+                ["All", "Main Question", "Choice"],
+                key="qb_simple_filter"
             )
         
         with col2:
-            schema_filter = st.multiselect(
-                "Schema Type:",
-                df["schema_type"].unique().tolist(),
-                default=df["schema_type"].unique().tolist(),
-                key="qb_schema_filter"
-            )
-        
-        with col3:
-            survey_filter = st.multiselect(
-                "Survey:",
-                df["survey_title"].unique().tolist(),
-                default=df["survey_title"].unique().tolist()[:5],  # Limit default
-                key="qb_survey_filter"
-            )
+            # Search box
+            search_term = st.text_input("🔍 Search questions:", key="qb_search")
         
         # Apply filters
         filtered_df = df.copy()
         
-        if question_type_filter == "Main Questions":
+        # Apply question type filter
+        if question_filter == "Main Question":
             filtered_df = filtered_df[filtered_df["is_choice"] == False]
-        elif question_type_filter == "Choices":
+        elif question_filter == "Choice":
             filtered_df = filtered_df[filtered_df["is_choice"] == True]
-        elif question_type_filter == "Identity Questions":
-            filtered_df = filtered_df[filtered_df["is_identity"] == True]
-        elif question_type_filter == "High Quality":
-            filtered_df = filtered_df[filtered_df["quality_score"] >= QUESTION_QUALITY_THRESHOLD]
         
-        if schema_filter:
-            filtered_df = filtered_df[filtered_df["schema_type"].isin(schema_filter)]
+        # Apply search filter
+        if search_term:
+            mask = filtered_df["question_text"].str.contains(search_term, case=False, na=False)
+            filtered_df = filtered_df[mask]
         
-        if survey_filter:
-            filtered_df = filtered_df[filtered_df["survey_title"].isin(survey_filter)]
-        
-        # Display table
+        # Display results
         if not filtered_df.empty:
+            # Results summary
+            st.info(f"📊 Showing {len(filtered_df)} results")
+            
+            # Display columns
             display_columns = [
                 "question_text", "schema_type", "quality_score", "is_identity", 
                 "identity_type", "choices_count", "survey_title"
@@ -990,22 +1163,22 @@ def show_question_bank_builder():
                 column_config={
                     "question_text": st.column_config.TextColumn("Question Text", width="large"),
                     "schema_type": st.column_config.TextColumn("Type", width="medium"),
-                    "quality_score": st.column_config.NumberColumn("Quality", width="small"),
+                    "quality_score": st.column_config.NumberColumn("Quality", width="small", format="%.2f"),
                     "is_identity": st.column_config.CheckboxColumn("Identity?", width="small"),
                     "identity_type": st.column_config.TextColumn("Identity Type", width="medium"),
                     "choices_count": st.column_config.NumberColumn("Choices", width="small"),
                     "survey_title": st.column_config.TextColumn("Survey", width="medium")
                 },
                 use_container_width=True,
-                height=400
+                height=500
             )
             
             # Download option
             csv_data = filtered_df.to_csv(index=False)
             st.download_button(
-                "📥 Download Question Bank",
+                "📥 Download Filtered Question Bank",
                 csv_data,
-                f"enhanced_question_bank_{uuid4().hex[:8]}.csv",
+                f"question_bank_{question_filter.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
                 "text/csv"
             )
         else:
