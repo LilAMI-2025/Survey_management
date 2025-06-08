@@ -273,7 +273,9 @@ def get_comprehensive_question_bank_from_snowflake(
         # Determine choice column
         choice_column = "CHOICE_TEXT"  # Default
         if not columns_result.empty:
-            choice_cols = columns_result['COLUMN_NAME'].tolist()
+            # Handle case-insensitive column names
+            column_name_col = 'column_name' if 'column_name' in columns_result.columns else 'COLUMN_NAME'
+            choice_cols = columns_result[column_name_col].tolist()
             if 'CHOICE_TEXT' in choice_cols:
                 choice_column = "CHOICE_TEXT"
             elif 'ROW_TEXT' in choice_cols:
@@ -299,7 +301,9 @@ def get_comprehensive_question_bank_from_snowflake(
                 stage_col_result = pd.read_sql(text(stage_col_query), conn)
             
             if not stage_col_result.empty:
-                stage_column = stage_col_result.iloc[0]['COLUMN_NAME']
+                # Handle case-insensitive column names
+                stage_column_col = 'column_name' if 'column_name' in stage_col_result.columns else 'COLUMN_NAME'
+                stage_column = stage_col_result.iloc[0][stage_column_col]
                 stage_filter = f" AND {stage_column} IN ('{stages_str}')"
         
         if grouped_by_stage:
@@ -454,7 +458,9 @@ def get_survey_stage_options():
             
         # Check if we have any stage-related columns
         if not columns_result.empty:
-            stage_column = columns_result.iloc[0]['COLUMN_NAME']
+            # Handle case-insensitive column names
+            column_name_col = 'column_name' if 'column_name' in columns_result.columns else 'COLUMN_NAME'
+            stage_column = columns_result.iloc[0][column_name_col]
             
             query = f"""
             SELECT DISTINCT {stage_column}
@@ -516,7 +522,7 @@ def get_snowflake_analytics():
 @st.cache_data(ttl=CACHE_TTL)
 def compute_tfidf_matches(df_reference, df_target):
     """Compute TF-IDF based matches between reference and target questions"""
-    # df_reference has question_text (from Snowflake), df_target has question_text (from user)
+    # df_reference has QUESTION_TEXT (from Snowflake), df_target has question_text (from user)
     df_reference = df_reference[df_reference["QUESTION_TEXT"].notna()].reset_index(drop=True)
     df_target = df_target[df_target["question_text"].notna()].reset_index(drop=True)
     
@@ -540,7 +546,7 @@ def compute_tfidf_matches(df_reference, df_target):
             conf = "❌ No match"
             best_idx = None
             
-        matched_uids.append(df_reference.iloc[best_idx]["MOST_RECENT_UID"] if best_idx is not None else None)
+        matched_uids.append(df_reference.iloc[best_idx]["UID"] if best_idx is not None else None)
         matched_qs.append(df_reference.iloc[best_idx]["QUESTION_TEXT"] if best_idx is not None else None)
         scores.append(round(best_score, 4))
         confs.append(conf)
@@ -564,7 +570,7 @@ def compute_semantic_matches(df_reference, df_target):
     for i in range(len(df_target)):
         best_idx = cosine_scores[i].argmax().item()
         score = cosine_scores[i][best_idx].item()
-        sem_matches.append(df_reference.iloc[best_idx]["MOST_RECENT_UID"] if score >= SEMANTIC_THRESHOLD else None)
+        sem_matches.append(df_reference.iloc[best_idx]["UID"] if score >= SEMANTIC_THRESHOLD else None)
         sem_scores.append(round(score, 4) if score >= SEMANTIC_THRESHOLD else None)
 
     df_target["Semantic_UID"] = sem_matches
@@ -882,7 +888,7 @@ def show_snowflake_matching():
                     
                     # Display results summary - maintaining original structure
                     total_questions = len(target_df)
-                    matched_questions = matched_results['FINAL_UID'].notna().sum()
+                    matched_questions = matched_results['Final_UID'].notna().sum()
                     match_rate = (matched_questions / total_questions * 100) if total_questions > 0 else 0
                     
                     st.success(f"✅ Matching completed! {matched_questions}/{total_questions} questions matched ({match_rate:.1f}%)")
@@ -897,7 +903,7 @@ def show_snowflake_matching():
                         st.metric("Matched Questions", matched_questions)
                     
                     with col3:
-                        unique_uids = matched_results['FINAL_UID'].nunique()
+                        unique_uids = matched_results['Final_UID'].nunique()
                         st.metric("Unique UIDs Found", unique_uids)
                     
                     with col4:
@@ -911,12 +917,12 @@ def show_snowflake_matching():
                     
                     # Select columns for display
                     results_cols = ['question_text']
-                    if 'FINAL_UID' in matched_results.columns:
-                        results_cols.append('FINAL_UID')
-                    if 'FINAL_MATCH_TYPE' in matched_results.columns:
-                        results_cols.append('FINAL_MATCH_TYPE')
-                    if 'SIMILARITY' in matched_results.columns:
-                        results_cols.append('SIMILARITY')
+                    if 'Final_UID' in matched_results.columns:
+                        results_cols.append('Final_UID')
+                    if 'Final_Match_Type' in matched_results.columns:
+                        results_cols.append('Final_Match_Type')
+                    if 'Similarity' in matched_results.columns:
+                        results_cols.append('Similarity')
                     if 'IS_IDENTITY' in matched_results.columns:
                         results_cols.extend(['IS_IDENTITY', 'IDENTITY_TYPE'])
                     
@@ -946,8 +952,8 @@ def show_snowflake_matching():
         
         with col1:
             st.markdown("**📊 Match Type Distribution**")
-            if 'FINAL_MATCH_TYPE' in results_df.columns:
-                match_type_counts = results_df['FINAL_MATCH_TYPE'].value_counts()
+            if 'Final_Match_Type' in results_df.columns:
+                match_type_counts = results_df['Final_Match_Type'].value_counts()
                 for match_type, count in match_type_counts.items():
                     st.text(f"• {match_type}: {count}")
         
