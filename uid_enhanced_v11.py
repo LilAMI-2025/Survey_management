@@ -403,36 +403,47 @@ def deduplicate_main_questions(main_questions_df):
     
     # Calculate semantic similarities for clustering
     if len(main_questions_df) > 1:
-        similarities = compute_semantic_similarities(main_questions_df["question_text"].tolist())
-        
-        # Group similar questions
-        processed = set()
-        indices_to_keep = []
-        
-        for i in range(len(main_questions_df)):
-            if i in processed:
-                continue
-                
-            # Find similar questions
-            similar_indices = [i]
-            for j in range(i + 1, len(main_questions_df)):
-                if j in processed:
+        try:
+            similarities = compute_semantic_similarities(main_questions_df["question_text"].tolist())
+            
+            # Group similar questions
+            processed = set()
+            indices_to_keep = []
+            
+            for i in range(len(main_questions_df)):
+                if i in processed:
                     continue
-                if i < len(similarities) and j < len(similarities[i]) and similarities[i][j] > SEMANTIC_THRESHOLD:
-                    similar_indices.append(j)
-                    processed.add(j)
-            
-            # Keep the best question from similar group - with bounds checking
-            try:
-                best_idx = max(similar_indices,
-                              key=lambda x: main_questions_df.iloc[x]["quality_score"] 
-                              if x < len(main_questions_df) else 0)  # Bounds check
-                indices_to_keep.append(best_idx)
-            except (IndexError, KeyError):
-                # Fallback to first item if there's any issue
-                indices_to_keep.append(similar_indices[0])
-            
-            processed.update(similar_indices)
+                    
+                # Find similar questions
+                similar_indices = [i]
+                for j in range(i + 1, len(main_questions_df)):
+                    if j in processed:
+                        continue
+                    
+                    # Safe similarity check with bounds
+                    try:
+                        if (i < len(similarities) and 
+                            j-i-1 < len(similarities[i]) and 
+                            similarities[i][j-i-1] > SEMANTIC_THRESHOLD):
+                            similar_indices.append(j)
+                            processed.add(j)
+                    except (IndexError, TypeError):
+                        continue
+                
+                # Keep the best question from similar group - with bounds checking
+                try:
+                    best_idx = max(similar_indices,
+                                  key=lambda x: main_questions_df.iloc[x]["quality_score"] 
+                                  if x < len(main_questions_df) else 0)  # Bounds check
+                    indices_to_keep.append(best_idx)
+                except (IndexError, KeyError, ValueError):
+                    # Fallback to first item if there's any issue
+                    indices_to_keep.append(similar_indices[0])
+                
+                processed.update(similar_indices)
+        except Exception as e:
+            logger.warning(f"Semantic similarity computation failed: {e}, using simple deduplication")
+            indices_to_keep = list(range(len(main_questions_df)))
     else:
         indices_to_keep = list(range(len(main_questions_df)))
     
@@ -452,32 +463,49 @@ def deduplicate_choices(choices_df):
     # Reset index to ensure continuous indexing
     choices_df = choices_df.reset_index(drop=True)
     
-    # Group by normalized text
-    choice_groups = choices_df.groupby("normalized_text").groups
-    indices_to_keep = []
-    
-    for normalized_text, group_indices in choice_groups.items():
-        group_indices = list(group_indices)  # Convert to list for indexing
-        
-        if len(group_indices) == 1:
-            indices_to_keep.append(group_indices[0])
+    try:
+        # Group by normalized text if column exists
+        if "normalized_text" in choices_df.columns:
+            choice_groups = choices_df.groupby("normalized_text").groups
         else:
-            # Keep the choice with highest quality score - with bounds checking
-            try:
-                best_idx = max(group_indices,
-                              key=lambda x: choices_df.iloc[x]["quality_score"] 
-                              if x < len(choices_df) else 0)  # Bounds check
-                indices_to_keep.append(best_idx)
-            except (IndexError, KeyError):
-                # Fallback to first item if there's any issue
+            # Fallback to grouping by choice_text
+            choices_df["normalized_text"] = choices_df.get("choice_text", choices_df.get("question_text", "")).apply(
+                lambda x: enhanced_normalize_text(str(x)) if pd.notna(x) else ""
+            )
+            choice_groups = choices_df.groupby("normalized_text").groups
+        
+        indices_to_keep = []
+        
+        for normalized_text, group_indices in choice_groups.items():
+            group_indices = list(group_indices)  # Convert to list for indexing
+            
+            if len(group_indices) == 1:
                 indices_to_keep.append(group_indices[0])
+            else:
+                # Keep the choice with highest quality score - with bounds checking
+                try:
+                    best_idx = max(group_indices,
+                                  key=lambda x: choices_df.iloc[x]["quality_score"] 
+                                  if x < len(choices_df) and "quality_score" in choices_df.columns else 0)
+                    indices_to_keep.append(best_idx)
+                except (IndexError, KeyError, ValueError):
+                    # Fallback to first item if there's any issue
+                    if group_indices and group_indices[0] < len(choices_df):
+                        indices_to_keep.append(group_indices[0])
+        
+        # Filter valid indices only
+        valid_indices = [idx for idx in indices_to_keep if idx < len(choices_df)]
+        
+        if valid_indices:
+            result_df = choices_df.iloc[valid_indices].reset_index(drop=True)
+        else:
+            result_df = choices_df.copy()
+            
+    except Exception as e:
+        logger.warning(f"Choice deduplication failed: {e}, returning original data")
+        result_df = choices_df.copy()
     
-    # Filter valid indices only
-    valid_indices = [idx for idx in indices_to_keep if idx < len(choices_df)]
-    
-    result_df = choices_df.iloc[valid_indices].reset_index(drop=True)
     logger.info(f"Choice deduplication: {len(choices_df)} → {len(result_df)} choices")
-    
     return result_df
 
 def extract_enhanced_questions(survey_json):
@@ -1008,6 +1036,149 @@ FROM question_stats
 WHERE usage_count >= 1  -- Filter out very rare questions if needed
 ORDER BY usage_count DESC, survey_count DESC
 """
+
+# ============= OPTIMIZED SURVEYMONKEY FUNCTIONS =============
+@st.cache_data(ttl=1800)
+def get_optimized_question_bank_from_surveymonkey():
+    """Optimized question bank extraction from SurveyMonkey using 'SELECT DISTINCT' equivalent logic"""
+    
+    token = get_enhanced_surveymonkey_token()
+    if not token:
+        st.warning("⚠️ SurveyMonkey token not available")
+        return pd.DataFrame()
+    
+    try:
+        # Step 1: Get ALL surveys efficiently (equivalent to SELECT DISTINCT survey_id)
+        headers = {"Authorization": f"Bearer {token}"}
+        all_surveys = []
+        page = 1
+        
+        with st.spinner("📊 Getting all surveys from SurveyMonkey..."):
+            while True:
+                params = {"per_page": 1000, "page": page}
+                response = requests.get("https://api.surveymonkey.com/v3/surveys", 
+                                      headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                page_surveys = data.get("data", [])
+                
+                if not page_surveys:
+                    break
+                    
+                all_surveys.extend(page_surveys)
+                total_surveys = data.get("total", 0)
+                
+                if len(all_surveys) >= total_surveys:
+                    break
+                    
+                page += 1
+                time.sleep(0.1)  # Rate limiting
+        
+        logger.info(f"Retrieved {len(all_surveys)} surveys for processing")
+        st.success(f"✅ Found {len(all_surveys)} total surveys")
+        
+        # Step 2: Optimized question extraction (equivalent to SELECT DISTINCT question_text)
+        unique_questions = {}  # Acts as SELECT DISTINCT
+        question_usage_stats = {}  # Track usage like COUNT(*) GROUP BY question_text
+        
+        # Process in smaller batches for better UI feedback
+        batch_size = 50
+        total_processed = 0
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_batches = (len(all_surveys) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(total_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(all_surveys))
+            batch_surveys = all_surveys[batch_start:batch_end]
+            
+            status_text.text(f"🔍 Processing batch {batch_idx + 1}/{total_batches} ({batch_start+1}-{batch_end} surveys)...")
+            
+            for survey in batch_surveys:
+                survey_id = survey["id"]
+                survey_title = survey.get("title", "Unknown")
+                
+                try:
+                    # Get survey details
+                    response = requests.get(
+                        f"https://api.surveymonkey.com/v3/surveys/{survey_id}/details", 
+                        headers=headers
+                    )
+                    response.raise_for_status()
+                    survey_json = response.json()
+                    
+                    # Extract questions efficiently
+                    questions = extract_enhanced_questions(survey_json)
+                    
+                    # Apply "SELECT DISTINCT" logic
+                    for q in questions:
+                        question_text = q["question_text"]
+                        
+                        # Equivalent to SELECT DISTINCT - only keep unique questions
+                        if question_text not in unique_questions:
+                            unique_questions[question_text] = q
+                            question_usage_stats[question_text] = {
+                                "usage_count": 1,
+                                "survey_count": 1,
+                                "survey_ids": [survey_id],
+                                "survey_titles": [survey_title]
+                            }
+                        else:
+                            # Equivalent to COUNT(*) GROUP BY - increment usage
+                            stats = question_usage_stats[question_text]
+                            stats["usage_count"] += 1
+                            
+                            if survey_id not in stats["survey_ids"]:
+                                stats["survey_count"] += 1
+                                stats["survey_ids"].append(survey_id)
+                                stats["survey_titles"].append(survey_title)
+                    
+                    time.sleep(REQUEST_DELAY)
+                    total_processed += 1
+                    
+                except Exception as e:
+                    # Skip problematic surveys but continue
+                    logger.warning(f"Skipped survey {survey_id}: {e}")
+                    continue
+            
+            progress_bar.progress((batch_idx + 1) / total_batches)
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        if not unique_questions:
+            st.error("❌ No questions extracted from surveys")
+            return pd.DataFrame()
+        
+        # Step 3: Create optimized dataset with usage statistics
+        enhanced_questions = []
+        for question_text, question_data in unique_questions.items():
+            stats = question_usage_stats[question_text]
+            
+            # Add usage statistics (equivalent to aggregation functions)
+            question_data.update({
+                "usage_count": stats["usage_count"],
+                "survey_count": stats["survey_count"],
+                "used_in_surveys": stats["survey_ids"][:5],  # Top 5 survey IDs
+                "survey_titles_sample": stats["survey_titles"][:3],  # Top 3 titles
+                "source": "surveymonkey_optimized"
+            })
+            
+            enhanced_questions.append(question_data)
+        
+        result_df = pd.DataFrame(enhanced_questions)
+        
+        logger.info(f"Optimized SurveyMonkey extraction: {total_processed} surveys → {len(unique_questions)} unique questions")
+        st.success(f"✅ Extracted {len(unique_questions)} unique questions from {total_processed} surveys!")
+        
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"Failed to get optimized question bank from SurveyMonkey: {e}")
+        st.error(f"❌ Failed to extract questions: {e}")
+        return pd.DataFrame()
 
 # ============= MAIN APPLICATION =============
 def main():
