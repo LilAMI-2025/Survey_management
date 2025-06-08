@@ -299,7 +299,7 @@ def get_enhanced_surveys_from_2023():
         per_page = 1000
         
         while True:
-            # API call with pagination
+            # API call with pagination - REMOVED problematic parameters
             params = {
                 "per_page": per_page,
                 "page": page
@@ -308,6 +308,7 @@ def get_enhanced_surveys_from_2023():
             response = requests.get("https://api.surveymonkey.com/v3/surveys", 
                                   headers=headers, params=params)
             response.raise_for_status()
+            
             data = response.json()
             page_surveys = data.get("data", [])
             
@@ -315,17 +316,15 @@ def get_enhanced_surveys_from_2023():
                 break
                 
             all_surveys.extend(page_surveys)
-            
-            # Check if we have more pages
             total_surveys = data.get("total", 0)
+            
             if len(all_surveys) >= total_surveys:
                 break
                 
             page += 1
-            # Add small delay to respect rate limits
-            time.sleep(0.1)
+            time.sleep(0.1)  # Rate limiting
         
-        # Filter for Template surveys only (no date restriction)
+        # Filter for Template surveys
         template_surveys = []
         for survey in all_surveys:
             title = survey.get("title", "").lower()
@@ -336,7 +335,7 @@ def get_enhanced_surveys_from_2023():
         return template_surveys
         
     except Exception as e:
-        logger.error(f"Failed to get Template surveys: {e}")
+        logger.error(f"Failed to get surveys from 2023+: {e}")
         return []
 
 # Backwards compatibility
@@ -395,94 +394,90 @@ def deduplicate_questions_advanced(all_questions_df):
     return result_df
 
 def deduplicate_main_questions(main_questions_df):
-    """Deduplicate main questions using semantic similarity - fixed indexing"""
+    """Deduplicate main questions with robust error handling"""
     if main_questions_df.empty:
         return main_questions_df
     
-    # Reset index to ensure clean integer indices
+    # Reset index to ensure continuous indexing
     main_questions_df = main_questions_df.reset_index(drop=True)
     
-    questions_list = main_questions_df["question_text"].tolist()
-    
-    # Compute semantic similarities
-    semantic_matrix = compute_semantic_similarities(questions_list)
-    
-    # Find duplicates
-    duplicates_to_remove = set()
-    SEMANTIC_SIMILARITY_THRESHOLD = 0.85  # High threshold for semantic similarity
-    TEXT_SIMILARITY_THRESHOLD = 0.80  # Adjusted threshold for text similarity
-    
-    for i in range(len(questions_list)):
-        if i in duplicates_to_remove:
-            continue
-            
-        for j in range(i + 1, len(questions_list)):
-            if j in duplicates_to_remove:
+    # Calculate semantic similarities for clustering
+    if len(main_questions_df) > 1:
+        similarities = compute_semantic_similarities(main_questions_df["question_text"].tolist())
+        
+        # Group similar questions
+        processed = set()
+        indices_to_keep = []
+        
+        for i in range(len(main_questions_df)):
+            if i in processed:
                 continue
+                
+            # Find similar questions
+            similar_indices = [i]
+            for j in range(i + 1, len(main_questions_df)):
+                if j in processed:
+                    continue
+                if i < len(similarities) and j < len(similarities[i]) and similarities[i][j] > SEMANTIC_THRESHOLD:
+                    similar_indices.append(j)
+                    processed.add(j)
             
-            # Check semantic similarity
-            semantic_sim = semantic_matrix[i][j] if semantic_matrix.size > 0 else 0
+            # Keep the best question from similar group - with bounds checking
+            try:
+                best_idx = max(similar_indices,
+                              key=lambda x: main_questions_df.iloc[x]["quality_score"] 
+                              if x < len(main_questions_df) else 0)  # Bounds check
+                indices_to_keep.append(best_idx)
+            except (IndexError, KeyError):
+                # Fallback to first item if there's any issue
+                indices_to_keep.append(similar_indices[0])
             
-            # Check text similarity using difflib
-            text_sim = compute_question_similarity(questions_list[i], questions_list[j])
-            
-            # Combined decision - either high semantic OR high text similarity
-            if semantic_sim > SEMANTIC_SIMILARITY_THRESHOLD or text_sim > TEXT_SIMILARITY_THRESHOLD:
-                # Keep the higher quality question
-                if main_questions_df.iloc[i]["quality_score"] >= main_questions_df.iloc[j]["quality_score"]:
-                    duplicates_to_remove.add(j)
-                else:
-                    duplicates_to_remove.add(i)
-                    break
+            processed.update(similar_indices)
+    else:
+        indices_to_keep = list(range(len(main_questions_df)))
     
-    # Remove duplicates
-    indices_to_keep = [i for i in range(len(main_questions_df)) if i not in duplicates_to_remove]
-    result_df = main_questions_df.iloc[indices_to_keep].reset_index(drop=True)
+    # Filter valid indices only
+    valid_indices = [idx for idx in indices_to_keep if idx < len(main_questions_df)]
     
-    st.success(f"✅ Main questions: {len(main_questions_df)} → {len(result_df)} (removed {len(duplicates_to_remove)} duplicates)")
+    result_df = main_questions_df.iloc[valid_indices].reset_index(drop=True)
+    logger.info(f"Main question deduplication: {len(main_questions_df)} → {len(result_df)} questions")
+    
     return result_df
 
 def deduplicate_choices(choices_df):
-    """Deduplicate choices with context awareness"""
+    """Deduplicate choice options with robust error handling"""
     if choices_df.empty:
         return choices_df
     
-    # Group choices by normalized choice text
-    choice_groups = {}
-    CHOICE_SIMILARITY_THRESHOLD = 0.85  # Adjusted threshold for choices using difflib
+    # Reset index to ensure continuous indexing
+    choices_df = choices_df.reset_index(drop=True)
     
-    for idx, row in choices_df.iterrows():
-        choice_text = row["choice_text"]
-        normalized_choice = enhanced_normalize_text(choice_text).lower()
-        
-        # Find similar existing choices
-        matched_group = None
-        for existing_choice in choice_groups.keys():
-            similarity = compute_question_similarity(normalized_choice, existing_choice)
-            if similarity > CHOICE_SIMILARITY_THRESHOLD:
-                matched_group = existing_choice
-                break
-        
-        if matched_group:
-            choice_groups[matched_group].append(idx)
-        else:
-            choice_groups[normalized_choice] = [idx]
-    
-    # Keep best representative from each group
+    # Group by normalized text
+    choice_groups = choices_df.groupby("normalized_text").groups
     indices_to_keep = []
-    for group_indices in choice_groups.values():
+    
+    for normalized_text, group_indices in choice_groups.items():
+        group_indices = list(group_indices)  # Convert to list for indexing
+        
         if len(group_indices) == 1:
             indices_to_keep.append(group_indices[0])
         else:
-            # Keep the choice with highest quality score
-            best_idx = max(group_indices, 
-                          key=lambda x: choices_df.iloc[x]["quality_score"])
-            indices_to_keep.append(best_idx)
+            # Keep the choice with highest quality score - with bounds checking
+            try:
+                best_idx = max(group_indices,
+                              key=lambda x: choices_df.iloc[x]["quality_score"] 
+                              if x < len(choices_df) else 0)  # Bounds check
+                indices_to_keep.append(best_idx)
+            except (IndexError, KeyError):
+                # Fallback to first item if there's any issue
+                indices_to_keep.append(group_indices[0])
     
-    result_df = choices_df.iloc[indices_to_keep].reset_index(drop=True)
+    # Filter valid indices only
+    valid_indices = [idx for idx in indices_to_keep if idx < len(choices_df)]
     
-    removed_count = len(choices_df) - len(result_df)
-    st.success(f"✅ Choices: {len(choices_df)} → {len(result_df)} (removed {removed_count} duplicates)")
+    result_df = choices_df.iloc[valid_indices].reset_index(drop=True)
+    logger.info(f"Choice deduplication: {len(choices_df)} → {len(result_df)} choices")
+    
     return result_df
 
 def extract_enhanced_questions(survey_json):
@@ -595,7 +590,7 @@ def get_enhanced_snowflake_references():
         HEADING_0, 
         UID, 
         COUNT(*) as AUTHORITY_COUNT
-    FROM AMI_DBT.DBT_PRODUCTION.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
+    FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
     WHERE UID IS NOT NULL AND HEADING_0 IS NOT NULL 
     AND TRIM(HEADING_0) != ''
     GROUP BY HEADING_0, UID
@@ -624,60 +619,9 @@ def get_enhanced_snowflake_references():
 def get_comprehensive_question_bank_from_snowflake():
     """Get comprehensive question bank directly from Snowflake - much faster than SurveyMonkey API"""
     
-    # Query to get ALL distinct questions that have been used historically
-    query = """
-    WITH question_stats AS (
-        SELECT 
-            HEADING_0 as question_text,
-            UID,
-            COUNT(*) as usage_count,
-            COUNT(DISTINCT SURVEY_ID) as survey_count,
-            MIN(CREATED_DATE) as first_used,
-            MAX(CREATED_DATE) as last_used,
-            -- Try to determine if it's a choice (contains " - " pattern)
-            CASE 
-                WHEN HEADING_0 LIKE '%-%' AND LENGTH(HEADING_0) - LENGTH(REPLACE(HEADING_0, '-', '')) >= 1 
-                THEN TRUE 
-                ELSE FALSE 
-            END as likely_choice,
-            -- Extract potential choice text
-            CASE 
-                WHEN HEADING_0 LIKE '%-%' 
-                THEN TRIM(SPLIT_PART(HEADING_0, '-', -1))
-                ELSE NULL 
-            END as potential_choice_text,
-            -- Extract potential parent question
-            CASE 
-                WHEN HEADING_0 LIKE '%-%' 
-                THEN TRIM(REGEXP_REPLACE(HEADING_0, ' - [^-]*$', ''))
-                ELSE HEADING_0 
-            END as potential_parent_question
-        FROM AMI_DBT.DBT_PRODUCTION.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
-        WHERE HEADING_0 IS NOT NULL 
-        AND TRIM(HEADING_0) != ''
-        AND LENGTH(TRIM(HEADING_0)) >= 3
-        GROUP BY HEADING_0, UID
-    )
-    SELECT 
-        question_text,
-        UID,
-        usage_count,
-        survey_count,
-        first_used,
-        last_used,
-        likely_choice,
-        potential_choice_text,
-        potential_parent_question,
-        -- Generate a unique question_id for consistency
-        ROW_NUMBER() OVER (ORDER BY usage_count DESC, question_text) as question_id
-    FROM question_stats
-    WHERE usage_count >= 1  -- Filter out very rare questions if needed
-    ORDER BY usage_count DESC, survey_count DESC
-    """
-    
     try:
         with get_enhanced_snowflake_engine().connect() as conn:
-            result = pd.read_sql(text(query), conn)
+            result = pd.read_sql(text(SNOWFLAKE_COMPREHENSIVE_QUERY), conn)
         
         logger.info(f"Comprehensive question bank loaded from Snowflake: {len(result)} records")
         
@@ -1012,6 +956,59 @@ def prepare_enhanced_export_data(final_df):
     
     return export_non_identity, export_identity
 
+# ============= OPTIMIZED QUERY CONSTANTS =============
+# Move SQL queries outside cached functions to avoid tokenize errors
+
+SNOWFLAKE_COMPREHENSIVE_QUERY = """
+WITH question_stats AS (
+    SELECT 
+        HEADING_0 as question_text,
+        UID,
+        COUNT(*) as usage_count,
+        COUNT(DISTINCT SURVEY_ID) as survey_count,
+        MIN(CREATED_DATE) as first_used,
+        MAX(CREATED_DATE) as last_used,
+        -- Try to determine if it's a choice (contains " - " pattern)
+        CASE 
+            WHEN HEADING_0 LIKE '%-%' AND LENGTH(HEADING_0) - LENGTH(REPLACE(HEADING_0, '-', '')) >= 1 
+            THEN TRUE 
+            ELSE FALSE 
+        END as likely_choice,
+        -- Extract potential choice text
+        CASE 
+            WHEN HEADING_0 LIKE '%-%' 
+            THEN TRIM(SPLIT_PART(HEADING_0, '-', -1))
+            ELSE NULL 
+        END as potential_choice_text,
+        -- Extract potential parent question
+        CASE 
+            WHEN HEADING_0 LIKE '%-%' 
+            THEN TRIM(REGEXP_REPLACE(HEADING_0, ' - [^-]*$', ''))
+            ELSE HEADING_0 
+        END as potential_parent_question
+    FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
+    WHERE HEADING_0 IS NOT NULL 
+    AND TRIM(HEADING_0) != ''
+    AND LENGTH(TRIM(HEADING_0)) >= 3
+    GROUP BY HEADING_0, UID
+)
+SELECT 
+    question_text,
+    UID,
+    usage_count,
+    survey_count,
+    first_used,
+    last_used,
+    likely_choice,
+    potential_choice_text,
+    potential_parent_question,
+    -- Generate a unique question_id for consistency
+    ROW_NUMBER() OVER (ORDER BY usage_count DESC, question_text) as question_id
+FROM question_stats
+WHERE usage_count >= 1  -- Filter out very rare questions if needed
+ORDER BY usage_count DESC, survey_count DESC
+"""
+
 # ============= MAIN APPLICATION =============
 def main():
     """Enhanced main application"""
@@ -1151,406 +1148,164 @@ def show_enhanced_home():
             st.rerun()
 
 def show_question_bank_builder():
-    """Enhanced question bank builder with multiple approaches"""
+    """Enhanced question bank builder with multiple optimized approaches"""
     st.markdown("## 📊 Enhanced Question Bank Builder")
     
     # Approach selection
-    st.markdown("### 🎯 Choose Your Approach")
+    st.markdown("### 🎯 Choose Your Data Source & Approach")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown('<div class="enhanced-card">', unsafe_allow_html=True)
-        st.markdown("#### 🚀 **Comprehensive SurveyMonkey Approach** (Recommended)")
-        st.markdown("• ✅ **ALL Questions** from your entire SurveyMonkey account")
-        st.markdown("• ⚡ **Much Faster** - No individual survey processing")
-        st.markdown("• 📊 **More Complete** - Includes non-template surveys")
-        st.markdown("• 🎯 **Usage-Based Filtering** - Real questions that have been used")
-        st.markdown("• 🤖 **AI Deduplication** applied after data collection")
-        
-        if st.button("🚀 Build Comprehensive Question Bank", type="primary", use_container_width=True):
-            st.session_state.selected_approach = "comprehensive"
+        st.markdown("#### 🚀 **Snowflake Direct Query** (Fastest)")
+        st.markdown("• ⚡ **Lightning Fast** - Direct SQL query")
+        st.markdown("• 📊 **Historical Data** - All questions ever used")
+        st.markdown("• 🎯 **Usage Statistics** - Frequency & survey counts")
+        st.markdown("• 📈 **Optimized** - SELECT DISTINCT with aggregation")
+        if st.button("🚀 Build from Snowflake", key="snowflake_approach"):
+            st.session_state.selected_approach = "snowflake"
         st.markdown('</div>', unsafe_allow_html=True)
     
     with col2:
-        st.markdown('<div class="question-bank-card">', unsafe_allow_html=True)
-        st.markdown("#### 📋 **Template-Only Approach** (Limited)")
-        st.markdown("• 🎯 **Template Surveys Only** - Limited to 17 surveys")
-        st.markdown("• ⏱️ **Slower** - Individual API calls per survey")
-        st.markdown("• 📉 **Less Complete** - Missing many questions")
-        st.markdown("• 🔍 **Good for Testing** - Smaller dataset")
-        st.markdown("• 🤖 **Same AI Deduplication** after processing")
-        
-        if st.button("📋 Build Template Question Bank", use_container_width=True):
-            st.session_state.selected_approach = "template"
+        st.markdown('<div class="enhanced-card">', unsafe_allow_html=True)
+        st.markdown("#### 📋 **SurveyMonkey Optimized** (Most Current)")
+        st.markdown("• 📝 **Complete Structure** - Questions + choices")
+        st.markdown("• 🔄 **Current Data** - Latest from SurveyMonkey")
+        st.markdown("• 🤖 **AI Enhanced** - Advanced deduplication")
+        st.markdown("• ⚡ **Batch Optimized** - Efficient API usage")
+        if st.button("📋 Build from SurveyMonkey", key="surveymonkey_approach"):
+            st.session_state.selected_approach = "surveymonkey"
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Show current stats if question bank exists
-    if st.session_state.question_bank_complete is not None:
-        df = st.session_state.question_bank_complete
-        
-        st.markdown("---")
-        st.markdown("### 📊 Current Question Bank Stats")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("📊 Total Questions", len(df))
-        with col2:
-            st.metric("❓ Main Questions", len(df[df["is_choice"] == False]))
-        with col3:
-            st.metric("🔘 Choices", len(df[df["is_choice"] == True]))
-        with col4:
-            source = df.iloc[0]["survey_title"] if len(df) > 0 else "Unknown"
-            st.metric("📋 Source", "Comprehensive" if "Historical" in source else "Template")
-    
     # Process based on selected approach
-    if st.session_state.get("selected_approach") == "comprehensive":
-        build_comprehensive_question_bank()
-    elif st.session_state.get("selected_approach") == "template":
-        build_template_question_bank()
+    if hasattr(st.session_state, 'selected_approach'):
+        
+        if st.session_state.selected_approach == "snowflake":
+            st.markdown("---")
+            st.markdown("### 🚀 Building Question Bank from Snowflake...")
+            
+            with st.spinner("Querying Snowflake database..."):
+                question_bank_df = get_comprehensive_question_bank_from_snowflake()
+            
+            if not question_bank_df.empty:
+                st.success(f"✅ Successfully loaded {len(question_bank_df)} questions from Snowflake!")
+                
+                # Advanced deduplication
+                with st.spinner("Applying AI-powered deduplication..."):
+                    dedup_df = deduplicate_questions_advanced(question_bank_df)
+                
+                # Save to session state
+                st.session_state.question_bank_snowflake = dedup_df
+                
+                # Display summary
+                display_question_bank_summary(dedup_df, "Snowflake")
+                
+            else:
+                st.error("❌ Failed to load questions from Snowflake")
+        
+        elif st.session_state.selected_approach == "surveymonkey":
+            st.markdown("---")
+            st.markdown("### 📋 Building Question Bank from SurveyMonkey...")
+            
+            with st.spinner("Optimized extraction from SurveyMonkey API..."):
+                question_bank_df = get_optimized_question_bank_from_surveymonkey()
+            
+            if not question_bank_df.empty:
+                st.success(f"✅ Successfully extracted {len(question_bank_df)} unique questions!")
+                
+                # Advanced deduplication
+                with st.spinner("Applying AI-powered deduplication..."):
+                    dedup_df = deduplicate_questions_advanced(question_bank_df)
+                
+                # Save to session state
+                st.session_state.question_bank_surveymonkey = dedup_df
+                
+                # Display summary
+                display_question_bank_summary(dedup_df, "SurveyMonkey")
+                
+            else:
+                st.error("❌ Failed to extract questions from SurveyMonkey")
     
-    # Display current question bank if exists
-    display_question_bank_explorer()
+    # Show existing question banks
+    show_existing_question_banks()
 
-def build_comprehensive_question_bank():
-    """Build comprehensive question bank using efficient SurveyMonkey approach"""
-    st.markdown("### 🚀 Building Comprehensive Question Bank")
+def display_question_bank_summary(df, source_name):
+    """Display summary statistics for the question bank"""
     
-    st.info("🔄 Using efficient approach adapted from uid_promax10.py - getting ALL questions from your SurveyMonkey account...")
-    
-    try:
-        # Step 1: Get all surveys efficiently (we already have pagination working)
-        with st.spinner("📊 Getting all surveys from SurveyMonkey..."):
-            all_surveys = get_enhanced_surveys_from_2023()  # This now gets ALL surveys due to pagination fix
-            
-            # But let's get ALL surveys, not just templates
-            token = get_enhanced_surveymonkey_token()
-            if not token:
-                st.error("❌ SurveyMonkey token not available")
-                return
-            
-            # Get ALL surveys (not just templates)
-            headers = {"Authorization": f"Bearer {token}"}
-            all_surveys_comprehensive = []
-            page = 1
-            
-            while True:
-                params = {"per_page": 1000, "page": page}
-                response = requests.get("https://api.surveymonkey.com/v3/surveys", 
-                                      headers=headers, params=params)
-                response.raise_for_status()
-                data = response.json()
-                page_surveys = data.get("data", [])
-                
-                if not page_surveys:
-                    break
-                    
-                all_surveys_comprehensive.extend(page_surveys)
-                total_surveys = data.get("total", 0)
-                
-                if len(all_surveys_comprehensive) >= total_surveys:
-                    break
-                    
-                page += 1
-                time.sleep(0.1)
-        
-        st.success(f"✅ Found {len(all_surveys_comprehensive)} total surveys in your account")
-        
-        # Step 2: Extract all unique questions efficiently
-        st.info("🔍 Extracting all unique questions from surveys (this may take a few minutes)...")
-        
-        # Process surveys in batches to avoid memory issues
-        batch_size = 50  # Smaller batches for better progress tracking
-        all_unique_questions = {}  # Use dict to automatically deduplicate
-        question_metadata = {}     # Store additional metadata
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        total_batches = (len(all_surveys_comprehensive) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(total_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(all_surveys_comprehensive))
-            batch_surveys = all_surveys_comprehensive[start_idx:end_idx]
-            
-            status_text.text(f"🔍 Processing batch {batch_idx + 1}/{total_batches} ({start_idx+1}-{end_idx} surveys)...")
-            
-            for survey in batch_surveys:
-                survey_id = survey["id"]
-                survey_title = survey.get("title", "Unknown")
-                
-                try:
-                    # Get survey details
-                    response = requests.get(
-                        f"https://api.surveymonkey.com/v3/surveys/{survey_id}/details", 
-                        headers=headers
-                    )
-                    response.raise_for_status()
-                    survey_json = response.json()
-                    
-                    # Extract questions
-                    questions = extract_enhanced_questions(survey_json)
-                    
-                    # Add to unique questions dict
-                    for q in questions:
-                        question_text = q["question_text"]
-                        
-                        if question_text not in all_unique_questions:
-                            all_unique_questions[question_text] = q
-                            question_metadata[question_text] = {
-                                "usage_count": 1,
-                                "survey_ids": [survey_id],
-                                "survey_titles": [survey_title]
-                            }
-                        else:
-                            # Update usage metadata
-                            question_metadata[question_text]["usage_count"] += 1
-                            if survey_id not in question_metadata[question_text]["survey_ids"]:
-                                question_metadata[question_text]["survey_ids"].append(survey_id)
-                                question_metadata[question_text]["survey_titles"].append(survey_title)
-                    
-                    time.sleep(REQUEST_DELAY)
-                    
-                except Exception as e:
-                    # Skip problematic surveys but continue
-                    continue
-            
-            progress_bar.progress((batch_idx + 1) / total_batches)
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        if not all_unique_questions:
-            st.error("❌ No questions extracted from surveys")
-            return
-        
-        # Step 3: Create enhanced question dataset
-        st.info(f"📊 Found {len(all_unique_questions)} unique questions across all surveys")
-        
-        # Convert to list and add usage metadata
-        enhanced_questions = []
-        for question_text, question_data in all_unique_questions.items():
-            metadata = question_metadata[question_text]
-            
-            # Enhance with usage data
-            question_data.update({
-                "usage_count": metadata["usage_count"],
-                "survey_count": len(metadata["survey_ids"]),
-                "used_in_surveys": metadata["survey_ids"][:5],  # Store up to 5 survey IDs
-                "survey_titles_sample": metadata["survey_titles"][:3]  # Store up to 3 titles
-            })
-            
-            enhanced_questions.append(question_data)
-        
-        # Step 4: Apply advanced deduplication
-        st.info("🤖 Applying advanced AI deduplication to comprehensive dataset...")
-        
-        all_questions_df = pd.DataFrame(enhanced_questions)
-        dedup_df = deduplicate_questions_advanced(all_questions_df)
-        
-        # Save to session state
-        st.session_state.question_bank_complete = dedup_df
-        
-        # Success summary
-        st.success(f"✅ **Comprehensive Question Bank Created Successfully!**")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        main_questions = dedup_df[dedup_df["is_choice"] == False]
-        choices = dedup_df[dedup_df["is_choice"] == True]
-        identity_questions = dedup_df[dedup_df["is_identity"] == True]
-        high_usage = dedup_df[dedup_df["usage_count"] >= 5]
-        
-        with col1:
-            st.metric("❓ Main Questions", len(main_questions))
-        with col2:
-            st.metric("🔘 Choice Options", len(choices))
-        with col3:
-            st.metric("🔐 Identity Questions", len(identity_questions))
-        with col4:
-            st.metric("⭐ High Usage (5+)", len(high_usage))
-        
-        st.info(f"📈 **Performance**: Processed {len(all_surveys_comprehensive)} surveys → {len(all_unique_questions)} unique questions → {len(dedup_df)} deduplicated questions")
-        
-    except Exception as e:
-        st.error(f"❌ Failed to build comprehensive question bank: {e}")
-        logger.error(f"Comprehensive question bank building failed: {e}")
-
-def build_template_question_bank():
-    """Build template-only question bank (original approach)"""
-    st.markdown("### 📋 Building Template Question Bank")
-    
-    # Get ALL Template surveys
-    template_surveys = get_enhanced_surveys_from_2023()
-    
-    if not template_surveys:
-        st.error("❌ No Template surveys found or connection failed")
-        return
-    
-    st.info(f"🎯 Found {len(template_surveys)} Template surveys")
-    
-    all_questions = []
-    token = get_enhanced_surveymonkey_token()
-    
-    if not token:
-        st.error("❌ SurveyMonkey token not available")
-        return
-    
-    # Progress tracking
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Process each Template survey
-    for i, survey in enumerate(template_surveys):
-        survey_id = survey["id"]
-        survey_title = survey.get("title", "Unknown")
-        
-        status_text.text(f"🔍 Processing Template survey {i+1}/{len(template_surveys)}: {survey_title[:50]}...")
-        
-        try:
-            # Get survey details
-            headers = {"Authorization": f"Bearer {token}"}
-            response = requests.get(
-                f"https://api.surveymonkey.com/v3/surveys/{survey_id}/details", 
-                headers=headers
-            )
-            response.raise_for_status()
-            survey_json = response.json()
-            
-            # Extract questions with enhanced structure
-            questions = extract_enhanced_questions(survey_json)
-            all_questions.extend(questions)
-            
-            time.sleep(REQUEST_DELAY)
-            progress_bar.progress((i + 1) / len(template_surveys))
-            
-        except Exception as e:
-            st.warning(f"⚠️ Skipped Template survey {survey_id}: {str(e)[:100]}")
-            continue
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    if not all_questions:
-        st.error("❌ No questions extracted from Template surveys")
-        return
-    
-    # Create initial dataframe
-    st.info(f"📊 Extracted {len(all_questions)} total questions and choices from Template surveys")
-    all_questions_df = pd.DataFrame(all_questions)
-    
-    # Advanced deduplication
-    dedup_df = deduplicate_questions_advanced(all_questions_df)
-    
-    # Save to session state
-    st.session_state.question_bank_complete = dedup_df
-    
-    # Success summary
-    st.success(f"✅ **Template Question Bank Created Successfully!**")
+    st.markdown(f"### 📊 {source_name} Question Bank Summary")
     
     col1, col2, col3, col4 = st.columns(4)
     
-    main_questions = dedup_df[dedup_df["is_choice"] == False]
-    choices = dedup_df[dedup_df["is_choice"] == True]
-    identity_questions = dedup_df[dedup_df["is_identity"] == True]
-    high_quality = dedup_df[dedup_df["quality_score"] >= QUESTION_QUALITY_THRESHOLD]
-    
     with col1:
-        st.metric("❓ Main Questions", len(main_questions))
+        st.metric("Total Questions", len(df))
+    
     with col2:
-        st.metric("🔘 Choice Options", len(choices))
+        main_questions = len(df[df["is_choice"] == False])
+        st.metric("Main Questions", main_questions)
+    
     with col3:
-        st.metric("🔐 Identity Questions", len(identity_questions))
+        choices = len(df[df["is_choice"] == True])
+        st.metric("Choices", choices)
+    
     with col4:
-        st.metric("⭐ High Quality", len(high_quality))
+        identity_questions = len(df[df["is_identity"] == True])
+        st.metric("Identity Questions", identity_questions)
+    
+    # Top quality questions
+    if "quality_score" in df.columns:
+        st.markdown("#### 🌟 Top Quality Questions")
+        top_questions = df.nlargest(5, "quality_score")[["question_text", "quality_score", "usage_count"]].reset_index(drop=True)
+        st.dataframe(top_questions, use_container_width=True)
+    
+    # Download option
+    csv_data = df.to_csv(index=False)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"question_bank_{source_name.lower()}_{timestamp}.csv"
+    
+    st.download_button(
+        label=f"📥 Download {source_name} Question Bank CSV",
+        data=csv_data,
+        file_name=filename,
+        mime="text/csv"
+    )
 
-def display_question_bank_explorer():
-    """Display question bank explorer if data exists"""
-    if st.session_state.question_bank_complete is None:
-        return
-    
-    df = st.session_state.question_bank_complete
-    
+def show_existing_question_banks():
+    """Show existing question banks in session state"""
     st.markdown("---")
-    st.markdown("### 📊 Question Bank Explorer")
+    st.markdown("### 📚 Available Question Banks")
     
-    # Simple filter dropdown as requested
-    col1, col2 = st.columns([1, 2])
+    banks_available = []
     
-    with col1:
-        question_filter = st.selectbox(
-            "📋 Question Type Filter:",
-            ["All", "Main Question", "Choice"],
-            key="qb_simple_filter"
-        )
+    # Check for Snowflake bank
+    if hasattr(st.session_state, 'question_bank_snowflake') and not st.session_state.question_bank_snowflake.empty:
+        banks_available.append(("Snowflake", st.session_state.question_bank_snowflake))
     
-    with col2:
-        # Search box
-        search_term = st.text_input("🔍 Search questions:", key="qb_search")
+    # Check for SurveyMonkey bank
+    if hasattr(st.session_state, 'question_bank_surveymonkey') and not st.session_state.question_bank_surveymonkey.empty:
+        banks_available.append(("SurveyMonkey", st.session_state.question_bank_surveymonkey))
     
-    # Apply filters
-    filtered_df = df.copy()
+    # Check for legacy banks
+    if hasattr(st.session_state, 'question_bank_complete') and not st.session_state.question_bank_complete.empty:
+        banks_available.append(("Legacy Template", st.session_state.question_bank_complete))
     
-    # Apply question type filter
-    if question_filter == "Main Question":
-        filtered_df = filtered_df[filtered_df["is_choice"] == False]
-    elif question_filter == "Choice":
-        filtered_df = filtered_df[filtered_df["is_choice"] == True]
-    
-    # Apply search filter
-    if search_term:
-        mask = filtered_df["question_text"].str.contains(search_term, case=False, na=False)
-        filtered_df = filtered_df[mask]
-    
-    # Display results
-    if not filtered_df.empty:
-        # Results summary
-        source_type = "Comprehensive" if filtered_df.iloc[0].get("usage_count", 0) > 0 else "Template"
-        st.info(f"📊 Showing {len(filtered_df)} results from {source_type} question bank")
-        
-        # Display columns - adapt based on data source
-        base_columns = ["question_text", "schema_type", "quality_score", "is_identity", "identity_type"]
-        
-        if "usage_count" in filtered_df.columns:
-            # Comprehensive data
-            display_columns = base_columns + ["usage_count", "survey_count"]
-        else:
-            # Template data
-            display_columns = base_columns + ["choices_count", "survey_title"]
-        
-        # Filter columns that actually exist
-        display_columns = [col for col in display_columns if col in filtered_df.columns]
-        
-        st.dataframe(
-            filtered_df[display_columns],
-            column_config={
-                "question_text": st.column_config.TextColumn("Question Text", width="large"),
-                "schema_type": st.column_config.TextColumn("Type", width="medium"),
-                "quality_score": st.column_config.NumberColumn("Quality", width="small", format="%.2f"),
-                "is_identity": st.column_config.CheckboxColumn("Identity?", width="small"),
-                "identity_type": st.column_config.TextColumn("Identity Type", width="medium"),
-                "usage_count": st.column_config.NumberColumn("Usage", width="small"),
-                "survey_count": st.column_config.NumberColumn("Surveys", width="small"),
-                "choices_count": st.column_config.NumberColumn("Choices", width="small"),
-                "survey_title": st.column_config.TextColumn("Survey", width="medium")
-            },
-            use_container_width=True,
-            height=500
-        )
-        
-        # Download option
-        csv_data = filtered_df.to_csv(index=False)
-        approach = "comprehensive" if "usage_count" in filtered_df.columns else "template"
-        st.download_button(
-            "📥 Download Question Bank",
-            csv_data,
-            f"{approach}_question_bank_{question_filter.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
-            "text/csv"
-        )
+    if banks_available:
+        for bank_name, bank_df in banks_available:
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.markdown(f"**{bank_name} Question Bank** - {len(bank_df)} questions")
+            
+            with col2:
+                if st.button(f"🔍 Explore", key=f"explore_{bank_name}"):
+                    st.session_state.selected_bank = bank_df
+                    st.session_state.selected_bank_name = bank_name
     else:
-        st.info("ℹ️ No questions match the selected filters")
+        st.info("🔨 No question banks built yet. Use the options above to create one!")
+    
+    # Show explorer if bank is selected
+    if hasattr(st.session_state, 'selected_bank') and not st.session_state.selected_bank.empty:
+        display_question_bank_explorer()
 
 def show_enhanced_matching():
     """Enhanced UID matching page"""
