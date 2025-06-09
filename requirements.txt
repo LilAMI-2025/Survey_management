@@ -1,7 +1,9 @@
-streamlit
-pandas
-requests
-sqlalchemy
-snowflake-sqlalchemy
-scikit-learn
-sentence-transformers
+streamlit>=1.28.0
+pandas>=2.0.0
+requests>=2.31.0
+sqlalchemy>=2.0.0
+snowflake-sqlalchemy>=1.4.0
+scikit-learn>=1.3.0
+sentence-transformers>=2.2.0
+snowflake-connector-python>=3.0.0
+python-dotenv>=1.0.0

@@ -45,16 +45,13 @@ CACHE_FILE = "survey_cache.json"
 REQUEST_DELAY = 0.5
 MAX_SURVEYS_PER_BATCH = 10
 
-# Identity types for export filtering
+# Identity types for export filtering - UPDATED to match user's exact 21 specifications
 IDENTITY_TYPES = [
-    'full name', 'first name', 'last name', 'e-mail', 'company', 'gender', 
-    'country', 'age', 'title', 'role', 'phone number', 'location', 
-    'pin', 'passport', 'date of birth', 'uct', 'student number',
-    'department', 'region', 'city', 'id number', 'marital status',
-    'education level', 'english proficiency', 'email', 'surname',
-    'name', 'contact', 'address', 'mobile', 'telephone', 'qualification',
-    'degree', 'identification', 'birth', 'married', 'single', 'language',
-    'sex', 'position', 'job', 'organization', 'organisation'
+    'Full Name', 'First Name', 'Last Name', 'E-Mail', 'Company', 'Gender', 
+    'Country', 'Age', 'Title/Role', 'Phone Number', 'Location', 
+    'PIN/Passport', 'Date of Birth', 'UCT Student Number',
+    'Department', 'Region', 'City', 'ID Number', 'Marital Status',
+    'Education level', 'English Proficiency'
 ]
 
 # Enhanced synonym mapping
@@ -1678,88 +1675,198 @@ def create_unique_uid_table(question_bank_with_authority):
         return pd.DataFrame()
 
 # ============= UID MATCHING FUNCTIONS =============
-def run_uid_match(question_bank, df_target):
-    """Run UID matching algorithm between question bank and target questions"""
+# ============= OPTIMIZED UID MATCHING FUNCTIONS =============
+@st.cache_data(ttl=3600)
+def precompute_reference_embeddings(question_bank):
+    """Pre-compute and cache reference embeddings for semantic matching"""
     try:
-        # Prepare question bank with normalized text
-        question_bank_norm = question_bank.copy()
-        question_bank_norm["norm_text"] = question_bank_norm["HEADING_0"].apply(enhanced_normalize)
-        
-        # Prepare target questions
-        df_target_norm = df_target.copy()
-        df_target_norm["norm_text"] = df_target_norm["question_text"].apply(enhanced_normalize)
-        
-        # Get TF-IDF vectors
-        vectorizer, reference_vectors = get_tfidf_vectors(question_bank_norm)
-        
-        # Initialize results
-        df_target_norm["Final_UID"] = None
-        df_target_norm["Match_Confidence"] = None
-        df_target_norm["Final_Match_Type"] = None
-        
-        # Load sentence transformer for semantic matching
         model = load_sentence_transformer()
+        reference_texts = question_bank["HEADING_0"].tolist()
+        embeddings = model.encode(reference_texts, convert_to_tensor=True, batch_size=32)
+        return embeddings
+    except Exception as e:
+        logger.error(f"Failed to precompute reference embeddings: {e}")
+        return None
+
+@st.cache_data(ttl=3600)
+def compute_tfidf_matches(df_reference, df_target, synonym_map=ENHANCED_SYNONYM_MAP):
+    """Compute TF-IDF based matches between reference and target questions"""
+    # df_reference has HEADING_0 (Snowflake), df_target has question_text (SurveyMonkey)
+    df_reference = df_reference[df_reference["HEADING_0"].notna()].reset_index(drop=True)
+    df_target = df_target[df_target["question_text"].notna()].reset_index(drop=True)
+    df_reference["norm_text"] = df_reference["HEADING_0"].apply(enhanced_normalize)
+    df_target["norm_text"] = df_target["question_text"].apply(enhanced_normalize)
+
+    vectorizer, ref_vectors = get_tfidf_vectors(df_reference)
+    target_vectors = vectorizer.transform(df_target["norm_text"])
+    similarity_matrix = cosine_similarity(target_vectors, ref_vectors)
+
+    matched_uids, matched_qs, scores, confs = [], [], [], []
+    for sim_row in similarity_matrix:
+        best_idx = sim_row.argmax()
+        best_score = sim_row[best_idx]
+        if best_score >= TFIDF_HIGH_CONFIDENCE:
+            conf = "✅ High"
+        elif best_score >= TFIDF_LOW_CONFIDENCE:
+            conf = "⚠️ Low"
+        else:
+            conf = "❌ No match"
+            best_idx = None
+        matched_uids.append(df_reference.iloc[best_idx]["UID"] if best_idx is not None else None)
+        matched_qs.append(df_reference.iloc[best_idx]["HEADING_0"] if best_idx is not None else None)
+        scores.append(round(best_score, 4))
+        confs.append(conf)
+
+    df_target["Suggested_UID"] = matched_uids
+    df_target["Matched_Question"] = matched_qs
+    df_target["Similarity"] = scores
+    df_target["Match_Confidence"] = confs
+    return df_target
+
+def compute_semantic_matches(df_reference, df_target):
+    """Compute semantic similarity matches using SentenceTransformer"""
+    model = load_sentence_transformer()
+    # df_target has question_text, df_reference has HEADING_0
+    emb_target = model.encode(df_target["question_text"].tolist(), convert_to_tensor=True)
+    emb_ref = model.encode(df_reference["HEADING_0"].tolist(), convert_to_tensor=True)
+    cosine_scores = util.cos_sim(emb_target, emb_ref)
+
+    sem_matches, sem_scores = [], []
+    for i in range(len(df_target)):
+        best_idx = cosine_scores[i].argmax().item()
+        score = cosine_scores[i][best_idx].item()
+        sem_matches.append(df_reference.iloc[best_idx]["UID"] if score >= SEMANTIC_THRESHOLD else None)
+        sem_scores.append(round(score, 4) if score >= SEMANTIC_THRESHOLD else None)
+
+    df_target["Semantic_UID"] = sem_matches
+    df_target["Semantic_Similarity"] = sem_scores
+    return df_target
+
+def assign_match_type(row):
+    """Assign final match type based on TF-IDF and semantic results"""
+    if pd.notnull(row["Suggested_UID"]):
+        return row["Match_Confidence"]
+    return "🧠 Semantic" if pd.notnull(row["Semantic_UID"]) else "❌ No match"
+
+def finalize_matches(df_target, df_reference):
+    """Finalize UID matches and create change options"""
+    # Apply UID Final reference matching first
+    df_target = apply_uid_final_reference_matching(df_target)
+    
+    # Prioritize UID Final reference, then TF-IDF, then semantic
+    df_target["Final_UID"] = (df_target.get("UID_Final_Direct", pd.Series(dtype='object'))
+                              .combine_first(df_target.get("Suggested_UID", pd.Series(dtype='object')))
+                              .combine_first(df_target.get("Semantic_UID", pd.Series(dtype='object'))))
+    
+    df_target["configured_final_UID"] = df_target["Final_UID"]
+    df_target["Final_Question"] = df_target.get("Matched_Question", "")
+    
+    # Update Final_Match_Type to reflect priority
+    def get_final_match_type(row):
+        if pd.notnull(row.get("UID_Final_Direct")):
+            return "🎯 UID Final"
+        elif pd.notnull(row.get("Suggested_UID")):
+            return row.get("Match_Confidence", "✅ High")
+        elif pd.notnull(row.get("Semantic_UID")):
+            return "🧠 Semantic"
+        else:
+            return "❌ No match"
+    
+    df_target["Final_Match_Type"] = df_target.apply(get_final_match_type, axis=1)
+    
+    # Prevent UID assignment for Heading questions
+    if "question_category" in df_target.columns:
+        df_target.loc[df_target["question_category"] == "Heading", ["Final_UID", "configured_final_UID"]] = None
+    
+    df_target["Change_UID"] = df_target["Final_UID"].apply(
+        lambda x: f"{x} - {df_reference[df_reference['UID'] == x]['HEADING_0'].iloc[0]}" if pd.notnull(x) and x in df_reference["UID"].values else None
+    )
+    
+    return df_target
+
+def detect_uid_conflicts(df_target):
+    """Detect UID conflicts where multiple questions have the same UID"""
+    uid_conflicts = df_target.groupby("Final_UID")["question_text"].nunique()
+    duplicate_uids = uid_conflicts[uid_conflicts > 1].index
+    df_target["UID_Conflict"] = df_target["Final_UID"].apply(
+        lambda x: "⚠️ Conflict" if pd.notnull(x) and x in duplicate_uids else ""
+    )
+    return df_target
+
+def apply_uid_final_reference_matching(df_target):
+    """Apply UID Final reference for direct matching before complex matching"""
+    try:
+        uid_final_ref = st.session_state.get('uid_final_reference', UID_FINAL_REFERENCE)
         
-        # Process in batches
-        for start_idx in range(0, len(df_target_norm), BATCH_SIZE):
-            end_idx = min(start_idx + BATCH_SIZE, len(df_target_norm))
-            batch_df = df_target_norm.iloc[start_idx:end_idx].copy()
-            
-            # Vectorize batch
-            batch_vectors = vectorizer.transform(batch_df["norm_text"])
-            
-            # Calculate TF-IDF similarities
-            tfidf_similarities = cosine_similarity(batch_vectors, reference_vectors)
-            
-            # Process each question in batch
-            for i, (idx, row) in enumerate(batch_df.iterrows()):
-                tfidf_scores = tfidf_similarities[i]
-                max_tfidf_idx = np.argmax(tfidf_scores)
-                max_tfidf_score = tfidf_scores[max_tfidf_idx]
-                
-                # TF-IDF matching
-                if max_tfidf_score >= TFIDF_HIGH_CONFIDENCE:
-                    matched_uid = question_bank_norm.iloc[max_tfidf_idx]["UID"]
-                    df_target_norm.at[idx, "Final_UID"] = matched_uid
-                    df_target_norm.at[idx, "Match_Confidence"] = "✅ High"
-                    df_target_norm.at[idx, "Final_Match_Type"] = "✅ High"
-                elif max_tfidf_score >= TFIDF_LOW_CONFIDENCE:
-                    matched_uid = question_bank_norm.iloc[max_tfidf_idx]["UID"]
-                    df_target_norm.at[idx, "Final_UID"] = matched_uid
-                    df_target_norm.at[idx, "Match_Confidence"] = "⚠️ Low"
-                    df_target_norm.at[idx, "Final_Match_Type"] = "⚠️ Low"
-                else:
-                    # Try semantic matching
-                    try:
-                        question_embedding = model.encode([row["question_text"]], convert_to_tensor=True)
-                        reference_embeddings = model.encode(question_bank_norm["HEADING_0"].tolist(), convert_to_tensor=True)
-                        semantic_scores = util.cos_sim(question_embedding, reference_embeddings)[0]
-                        max_semantic_score = max(semantic_scores).item()
-                        
-                        if max_semantic_score >= SEMANTIC_THRESHOLD:
-                            max_semantic_idx = semantic_scores.argmax().item()
-                            matched_uid = question_bank_norm.iloc[max_semantic_idx]["UID"]
-                            df_target_norm.at[idx, "Final_UID"] = matched_uid
-                            df_target_norm.at[idx, "Match_Confidence"] = "🧠 Semantic"
-                            df_target_norm.at[idx, "Final_Match_Type"] = "🧠 Semantic"
-                        else:
-                            df_target_norm.at[idx, "Final_UID"] = None
-                            df_target_norm.at[idx, "Match_Confidence"] = "❌ No match"
-                            df_target_norm.at[idx, "Final_Match_Type"] = "❌ No match"
-                    except Exception as e:
-                        logger.error(f"Semantic matching failed for question {idx}: {e}")
-                        df_target_norm.at[idx, "Final_UID"] = None
-                        df_target_norm.at[idx, "Match_Confidence"] = "❌ No match"
-                        df_target_norm.at[idx, "Final_Match_Type"] = "❌ No match"
+        if not uid_final_ref:
+            logger.info("No UID Final reference available")
+            return df_target
         
-        # Remove normalization column before returning
-        df_target_norm = df_target_norm.drop(columns=["norm_text"])
+        # Initialize UID Final reference columns
+        df_target["UID_Final_Direct"] = None
+        df_target["UID_Final_Match"] = False
         
-        return df_target_norm
+        direct_matches = 0
+        for idx, row in df_target.iterrows():
+            question_text = row.get("question_text", "")
+            
+            # Direct match with UID Final reference
+            if question_text in uid_final_ref:
+                df_target.at[idx, "UID_Final_Direct"] = uid_final_ref[question_text]
+                df_target.at[idx, "UID_Final_Match"] = True
+                direct_matches += 1
+            else:
+                # Try fuzzy matching with cleaned question text
+                cleaned_text = clean_question_text(question_text)
+                if cleaned_text in uid_final_ref:
+                    df_target.at[idx, "UID_Final_Direct"] = uid_final_ref[cleaned_text]
+                    df_target.at[idx, "UID_Final_Match"] = True
+                    direct_matches += 1
+        
+        logger.info(f"🎯 UID Final direct matches: {direct_matches}/{len(df_target)}")
+        return df_target
         
     except Exception as e:
-        logger.error(f"UID matching failed: {e}")
-        # Return original dataframe with empty UID columns
+        logger.error(f"Failed to apply UID Final reference matching: {e}")
+        return df_target
+
+def run_uid_match_optimized(question_bank, df_target):
+    """Improved UID matching with TF-IDF + Semantic matching"""
+    if question_bank.empty or df_target.empty:
+        st.error("Input data is empty.")
+        return pd.DataFrame()
+
+    df_results = []
+    batch_size = BATCH_SIZE
+    for start in range(0, len(df_target), batch_size):
+        batch_target = df_target.iloc[start:start + batch_size].copy()
+        with st.spinner(f"Processing batch {start//batch_size + 1}..."):
+            batch_target = compute_tfidf_matches(question_bank, batch_target)
+            batch_target = compute_semantic_matches(question_bank, batch_target)
+            batch_target = finalize_matches(batch_target, question_bank)
+            batch_target = detect_uid_conflicts(batch_target)
+        df_results.append(batch_target)
+    
+    return pd.concat(df_results, ignore_index=True) if df_results else pd.DataFrame()
+
+def run_uid_match(question_bank, df_target):
+    """Run UID matching algorithm between question bank and target questions - OPTIMIZED VERSION"""
+    try:
+        logger.info("🚀 Starting OPTIMIZED UID matching...")
+        
+        # Use the optimized version
+        result_df = run_uid_match_optimized(question_bank, df_target)
+        
+        # Add Match_Confidence for backward compatibility if not present
+        if "Match_Confidence" not in result_df.columns and "Final_Match_Type" in result_df.columns:
+            result_df["Match_Confidence"] = result_df["Final_Match_Type"]
+        
+        logger.info(f"✅ Optimized UID matching completed: {len(result_df)} questions processed")
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"Optimized UID matching failed, falling back to basic assignment: {e}")
+        # Fallback to basic UID assignment
         df_target["Final_UID"] = None
         df_target["Match_Confidence"] = "❌ Error"
         df_target["Final_Match_Type"] = "❌ Error"
@@ -1807,6 +1914,120 @@ def prepare_export_data(df_final):
     except Exception as e:
         logger.error(f"Failed to prepare export data: {e}")
         return pd.DataFrame(), pd.DataFrame()
+
+def prepare_export_data_improved(df_final):
+    """Prepare export data split into identity and non-identity tables with enhanced features"""
+    try:
+        if df_final is None or df_final.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        
+        # Filter for main questions only (not choices)
+        main_questions = df_final[df_final["is_choice"] == False].copy()
+        
+        if main_questions.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        
+        # Add identity classification using improved function
+        main_questions['is_identity'] = main_questions['question_text'].apply(contains_identity_info)
+        
+        # Use improved identity detection with survey context
+        main_questions['identity_type'] = main_questions.apply(
+            lambda row: determine_identity_type_improved(
+                row['question_text'], 
+                row.get('survey_id'), 
+                row.get('question_uid')
+            ), axis=1
+        )
+        
+        # Split into identity and non-identity questions
+        identity_questions = main_questions[main_questions['is_identity'] == True].copy()
+        non_identity_questions = main_questions[main_questions['is_identity'] == False].copy()
+        
+        # Prepare non-identity export (Table 1) - SURVEY_ID, QUESTION_ID, QUESTION_NUMBER, UID
+        export_df_non_identity = pd.DataFrame()
+        if not non_identity_questions.empty:
+            export_df_non_identity = non_identity_questions[[
+                'survey_id', 'question_uid', 'position', 'Final_UID'
+            ]].copy()
+            export_df_non_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'QUESTION_NUMBER', 'UID']
+        
+        # Prepare identity export (Table 2) - SURVEY_ID, QUESTION_ID, QUESTION_NUMBER, ROWS_ID, IDENTITY_TYPE, UID
+        export_df_identity = pd.DataFrame()
+        if not identity_questions.empty:
+            # Add ROWS_ID as a unique identifier for each row
+            identity_questions['rows_id'] = range(1, len(identity_questions) + 1)
+            
+            export_df_identity = identity_questions[[
+                'survey_id', 'question_uid', 'position', 'rows_id', 'identity_type', 'Final_UID'
+            ]].copy()
+            export_df_identity.columns = ['SURVEY_ID', 'QUESTION_ID', 'QUESTION_NUMBER', 'ROWS_ID', 'IDENTITY_TYPE', 'UID']
+        
+        return export_df_non_identity, export_df_identity
+        
+    except Exception as e:
+        logger.error(f"Failed to prepare improved export data: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+def determine_identity_type_improved(text, survey_id=None, question_id=None):
+    """Determine the specific identity type from question text with survey context"""
+    if not isinstance(text, str):
+        return 'Unknown'
+    
+    text_lower = text.lower().strip()
+    
+    # Special handling for specific survey/question combinations
+    if survey_id == "523232875" and question_id == "247436134":
+        # This specific case is not phone number based on user feedback
+        if 'phone' in text_lower or 'mobile' in text_lower:
+            # Check if it's actually asking for contact preference rather than phone number
+            if 'contact' in text_lower or 'prefer' in text_lower or 'best way' in text_lower:
+                return 'Contact Preference'
+    
+    # Priority order for identity type detection - UPDATED to match user's exact specifications
+    if any(name in text_lower for name in ['first name', 'firstname']):
+        return 'First Name'
+    elif any(name in text_lower for name in ['last name', 'lastname', 'surname']):
+        return 'Last Name'
+    elif any(name in text_lower for name in ['full name']) or ('name' in text_lower and 'first' not in text_lower and 'last' not in text_lower and 'company' not in text_lower):
+        return 'Full Name'
+    elif any(email in text_lower for email in ['email', 'e-mail', 'mail']):
+        return 'E-Mail'
+    elif any(company in text_lower for company in ['company', 'organization', 'organisation']):
+        return 'Company'
+    elif any(phone in text_lower for phone in ['phone', 'mobile', 'telephone']):
+        return 'Phone Number'
+    elif 'gender' in text_lower or 'sex' in text_lower:
+        return 'Gender'
+    elif 'age' in text_lower:
+        return 'Age'
+    elif any(title in text_lower for title in ['title', 'position', 'role', 'job']):
+        return 'Title/Role'
+    elif 'country' in text_lower:
+        return 'Country'
+    elif 'region' in text_lower:
+        return 'Region'
+    elif 'city' in text_lower:
+        return 'City'
+    elif 'department' in text_lower:
+        return 'Department'
+    elif any(loc in text_lower for loc in ['location', 'address']):
+        return 'Location'
+    elif any(id_type in text_lower for id_type in ['id number', 'identification']):
+        return 'ID Number'
+    elif 'passport' in text_lower or 'pin' in text_lower:
+        return 'PIN/Passport'
+    elif 'uct student number' in text_lower or ('uct' in text_lower and 'student' in text_lower):
+        return 'UCT Student Number'
+    elif any(dob in text_lower for dob in ['date of birth', 'dob', 'birth']):
+        return 'Date of Birth'
+    elif 'marital' in text_lower:
+        return 'Marital Status'
+    elif any(edu in text_lower for edu in ['education level', 'education', 'qualification', 'degree']):
+        return 'Education level'
+    elif 'english proficiency' in text_lower or ('language' in text_lower and 'proficiency' in text_lower):
+        return 'English Proficiency'
+    else:
+        return 'Other'
 
 def upload_to_snowflake_tables(export_df_non_identity, export_df_identity):
     """Upload both export tables to Snowflake"""
@@ -2842,7 +3063,9 @@ elif st.session_state.page == "uid_matching":
     st.markdown("### 📊 Current Survey Data")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Total Questions", len(st.session_state.df_target))
+        # Count headings instead of total questions  
+        headings_count = len(st.session_state.df_target[st.session_state.df_target.get("question_category", "") == "Heading"])
+        st.metric("📑 Headings", headings_count)
     with col2:
         main_q = len(st.session_state.df_target[st.session_state.df_target["is_choice"] == False])
         st.metric("Main Questions", main_q)
@@ -2892,7 +3115,9 @@ elif st.session_state.page == "uid_matching":
         
         with col4:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            no_match = len(st.session_state.df_final[st.session_state.df_final.get("Final_UID", pd.Series()).isna()])
+            # Calculate no match based on selected surveys only (main questions without UIDs)
+            main_questions_df = st.session_state.df_final[st.session_state.df_final["is_choice"] == False]
+            no_match = len(main_questions_df[main_questions_df.get("Final_UID", pd.Series()).isna()])
             st.metric("❌ No Match", no_match)
             st.markdown('</div>', unsafe_allow_html=True)
         
@@ -2983,8 +3208,8 @@ elif st.session_state.page == "uid_matching":
         st.markdown("---")
         st.markdown("### 📥 Export & Upload")
         
-        # Prepare export data - now returns two tables
-        export_df_non_identity, export_df_identity = prepare_export_data(st.session_state.df_final)
+        # Prepare export data - now uses the IMPROVED function
+        export_df_non_identity, export_df_identity = prepare_export_data_improved(st.session_state.df_final)
         
         if not export_df_non_identity.empty or not export_df_identity.empty:
             
@@ -3008,7 +3233,7 @@ elif st.session_state.page == "uid_matching":
             
             # Identity Questions Preview  
             if not export_df_identity.empty:
-                st.markdown("**🔐 Identity Questions (Table 2)**")
+                st.markdown("**🔐 Identity Questions (Table 2) - Updated with Question Number & UID**")
                 st.dataframe(export_df_identity.head(10), use_container_width=True)
             
             # Download options
