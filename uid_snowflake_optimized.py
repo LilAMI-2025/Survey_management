@@ -7,10 +7,11 @@ Complete standalone implementation without external dependencies.
 """
 
 import streamlit as st
+import requests
 
 # Set page config FIRST before any other Streamlit commands
 st.set_page_config(
-    page_title="UID Matcher Enhanced - Snowflake Optimized",
+    page_title="Snowflake UID Management",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="❄️"
@@ -28,17 +29,57 @@ from sentence_transformers import SentenceTransformer
 from sentence_transformers import util
 import warnings
 warnings.filterwarnings('ignore')
+import io
 
 # Configuration
-SNOWFLAKE_QUERY_LIMIT = 10000  # Expanded from 100 for comprehensive data
-DEFAULT_SURVEY_STAGES = ["Annual Impact Survey", "AP Survey"]  # Default filter options
-CACHE_TTL = 3600  # 1 hour cache
+SNOWFLAKE_QUERY_LIMIT = 50000
+CACHE_TTL = 300  # 5 minutes
 BATCH_SIZE = 100
+TFIDF_HIGH_CONFIDENCE = 0.7
+TFIDF_LOW_CONFIDENCE = 0.4
+SEMANTIC_THRESHOLD = 0.75
 
-# Matching thresholds
-TFIDF_HIGH_CONFIDENCE = 0.85
-TFIDF_LOW_CONFIDENCE = 0.6
-SEMANTIC_THRESHOLD = 0.7
+# Enhanced synonym mapping for text normalization
+ENHANCED_SYNONYM_MAP = {
+    'organisation': 'organization', 'organisations': 'organizations',
+    'colour': 'color', 'colours': 'colors', 'realise': 'realize', 'realised': 'realized',
+    'utilise': 'utilize', 'utilised': 'utilized', 'favourite': 'favorite',
+    'centre': 'center', 'theatre': 'theater', 'metre': 'meter',
+    'programme': 'program', 'programmes': 'programs',
+    'behaviour': 'behavior', 'behaviours': 'behaviors',
+    'honour': 'honor', 'honours': 'honors', 'labour': 'labor',
+    'neighbour': 'neighbor', 'neighbours': 'neighbors',
+    'analyse': 'analyze', 'analysed': 'analyzed', 'analyses': 'analyzes',
+    'capitalise': 'capitalize', 'capitalised': 'capitalized',
+    'categorise': 'categorize', 'categorised': 'categorized',
+    'emphasise': 'emphasize', 'emphasised': 'emphasized',
+    'minimise': 'minimize', 'minimised': 'minimized',
+    'optimise': 'optimize', 'optimised': 'optimized',
+    'recognise': 'recognize', 'recognised': 'recognized',
+    'summarise': 'summarize', 'summarised': 'summarized',
+    'synthesise': 'synthesize', 'synthesised': 'synthesized',
+    'whilst': 'while', 'amongst': 'among', 'towards': 'toward'
+}
+
+# Identity detection patterns
+IDENTITY_PATTERNS = {
+    'Age': [r'\bage\b', r'\bold\b', r'\byoung\b', r'\byears?\s+old\b', r'\bbirth\s*year\b', r'\bdob\b', r'\bdate\s+of\s+birth\b'],
+    'City': [r'\bcity\b', r'\btown\b', r'\bmunicipality\b', r'\burban\s+area\b', r'\blocal\s+area\b'],
+    'Company': [r'\bcompany\b', r'\borganiz[as]tion\b', r'\bbusiness\b', r'\bemployer\b', r'\bworkplace\b', r'\bfirm\b', r'\bcorporation\b'],
+    'Country': [r'\bcountry\b', r'\bnation\b', r'\bnationality\b', r'\bcitizenship\b', r'\bpassport\b'],
+    'Date of Birth': [r'\bdate\s+of\s+birth\b', r'\bdob\b', r'\bbirth\s*date\b', r'\bbirthday\b', r'\bborn\s+on\b'],
+    'E-Mail': [r'\bemail\b', r'\be-mail\b', r'\belectronic\s+mail\b', r'@', r'\bcontact\s+details\b'],
+    'Education level': [r'\beducation\b', r'\bdegree\b', r'\bqualification\b', r'\buniversity\b', r'\bcollege\b', r'\bschool\b', r'\bacademic\b'],
+    'Full Name': [r'\bfull\s+name\b', r'\bcomplete\s+name\b', r'\bfirst\s+and\s+last\s+name\b'],
+    'First Name': [r'\bfirst\s+name\b', r'\bgiven\s+name\b', r'\bforename\b'],
+    'Last Name': [r'\blast\s+name\b', r'\bsurname\b', r'\bfamily\s+name\b'],
+    'Gender': [r'\bgender\b', r'\bsex\b', r'\bmale\b', r'\bfemale\b', r'\bman\b', r'\bwoman\b', r'\bpronoun\b'],
+    'Location': [r'\blocation\b', r'\baddress\b', r'\bwhere\s+do\s+you\s+live\b', r'\bresidence\b', r'\bpostal\s+code\b', r'\bzip\s+code\b'],
+    'Phone Number': [r'\bphone\b', r'\btelephone\b', r'\bmobile\b', r'\bcell\b', r'\bnumber\b', r'\bcontact\s+number\b'],
+    'Region': [r'\bregion\b', r'\bstate\b', r'\bprovince\b', r'\barea\b', r'\bdistrict\b', r'\bcounty\b'],
+    'Title/Role': [r'\btitle\b', r'\brole\b', r'\bposition\b', r'\bjob\b', r'\boccupation\b', r'\bprofession\b'],
+    'PIN/Passport': [r'\bpin\b', r'\bpassport\b', r'\bid\s+number\b', r'\bidentification\b', r'\bsocial\s+security\b']
+}
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -46,174 +87,107 @@ logger = logging.getLogger(__name__)
 
 # ============= SESSION STATE INITIALIZATION =============
 def initialize_session_state():
-    """Initialize session state variables"""
-    if 'page' not in st.session_state:
-        st.session_state.page = "home"
-    if 'question_bank_complete' not in st.session_state:
-        st.session_state.question_bank_complete = None
-    if 'matched_results' not in st.session_state:
-        st.session_state.matched_results = None
+    """Initialize Streamlit session state variables"""
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = 'home'
+    if 'question_bank_data' not in st.session_state:
+        st.session_state.question_bank_data = pd.DataFrame()
+    if 'matching_results' not in st.session_state:
+        st.session_state.matching_results = pd.DataFrame()
+    if 'selected_survey_stages' not in st.session_state:
+        st.session_state.selected_survey_stages = []
 
 # Initialize session state
 initialize_session_state()
 
-# ============= CORE UTILITY FUNCTIONS =============
-
+# ============= CORE FUNCTIONS =============
 @st.cache_resource
 def get_snowflake_engine():
-    """Create Snowflake engine using Streamlit secrets"""
+    """Create and return Snowflake engine"""
     try:
-        sf = st.secrets["snowflake"]
-        engine = create_engine(
-            f"snowflake://{sf['user']}:{sf['password']}@{sf['account']}/{sf['database']}/{sf['schema']}?warehouse={sf['warehouse']}&role={sf['role']}"
+        connection_string = (
+            f"snowflake://{st.secrets['snowflake']['user']}:"
+            f"{st.secrets['snowflake']['password']}@"
+            f"{st.secrets['snowflake']['account']}/"
+            f"{st.secrets['snowflake']['database']}/"
+            f"{st.secrets['snowflake']['schema']}?"
+            f"warehouse={st.secrets['snowflake']['warehouse']}&"
+            f"role={st.secrets['snowflake']['role']}"
         )
-        return engine
+        return create_engine(connection_string)
     except Exception as e:
-        st.warning(
-            f"Snowflake connection failed: {e}. "
-            "Please check your secrets configuration."
-        )
+        logger.error(f"Failed to create Snowflake engine: {e}")
         return None
 
 @st.cache_resource
 def load_sentence_transformer():
-    """Load SentenceTransformer model for semantic matching"""
+    """Load SentenceTransformer model"""
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-def enhanced_normalize(text):
-    """Enhanced text normalization for better matching"""
+def enhanced_normalize(text, synonym_map=ENHANCED_SYNONYM_MAP):
+    """Enhanced text normalization with synonym mapping"""
     if pd.isna(text) or text == "":
         return ""
     
-    # Convert to lowercase and strip
     text = str(text).lower().strip()
-    
-    # Remove special characters but keep spaces
     text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     
-    # Replace multiple spaces with single space
-    text = re.sub(r'\s+', ' ', text)
-    
-    return text.strip()
+    words = text.split()
+    normalized_words = [synonym_map.get(word, word) for word in words]
+    return ' '.join(normalized_words)
 
 def clean_question_text(text):
     """Clean question text for better matching"""
-    if pd.isna(text) or text == "":
+    if pd.isna(text):
         return ""
     
     text = str(text).strip()
-    
-    # Remove common prefixes/suffixes
-    text = re.sub(r'^(Question:|Q\d+:|Question \d+:)', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s*\(.*?\)\s*$', '', text)  # Remove trailing parentheses
-    
-    return text.strip()
+    text = re.sub(r'\s*\[.*?\]\s*', '', text)
+    text = re.sub(r'\s*\(.*?\)\s*', '', text)
+    text = re.sub(r'[^\w\s\-]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def contains_identity_info(text):
-    """Enhanced identity detection with 16 specific types"""
-    if not isinstance(text, str):
+    """Check if text contains identity information"""
+    if pd.isna(text) or text == "":
         return False
     
-    text_lower = text.lower().strip()
-    
-    # 16 identity patterns
-    identity_patterns = [
-        # Age patterns
-        r'\b(age|how old|birth year|born in)\b',
-        # City patterns  
-        r'\b(city|town|municipality|where.*live|location.*city)\b',
-        # Company patterns
-        r'\b(company|organization|employer|work for|employed by)\b',
-        # Country patterns
-        r'\b(country|nation|nationality|where.*from|citizenship)\b',
-        # Date of Birth patterns
-        r'\b(date.*birth|birthday|born on|birth date|dob)\b',
-        # Email patterns
-        r'\b(email|e-mail|email address|contact.*email)\b',
-        # Education patterns
-        r'\b(education|degree|qualification|university|college|school)\b',
-        # Full Name patterns
-        r'\b(full name|complete name|first.*last name|your name)\b',
-        # First Name patterns
-        r'\b(first name|given name|forename)\b',
-        # Last Name patterns
-        r'\b(last name|surname|family name|lastname)\b',
-        # Gender patterns
-        r'\b(gender|sex|male|female|identify as)\b',
-        # Location patterns
-        r'\b(location|address|where.*located|postal code|zip code)\b',
-        # Phone patterns
-        r'\b(phone|telephone|mobile|contact.*number)\b',
-        # Region patterns
-        r'\b(region|state|province|area|district)\b',
-        # Title/Role patterns
-        r'\b(title|position|role|job title|designation)\b',
-        # PIN/Passport patterns
-        r'\b(pin|passport|id number|identification|social security)\b'
-    ]
-    
-    return any(re.search(pattern, text_lower) for pattern in identity_patterns)
+    text_lower = str(text).lower()
+    for identity_type, patterns in IDENTITY_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, text_lower):
+                return True
+    return False
 
 def determine_identity_type(text):
-    """Determine specific identity type from 16 categories"""
-    if not isinstance(text, str):
-        return "Unknown"
+    """Determine the specific type of identity information"""
+    if pd.isna(text) or text == "":
+        return "Not Identity"
     
-    text_lower = text.lower().strip()
+    text_lower = str(text).lower()
     
-    # Check each identity type in order of specificity
-    if re.search(r'\b(date.*birth|birthday|born on|birth date|dob)\b', text_lower):
-        return "Date of Birth"
-    elif re.search(r'\b(full name|complete name|first.*last name|your name)\b', text_lower):
-        return "Full Name"
-    elif re.search(r'\b(first name|given name|forename)\b', text_lower):
-        return "First Name"
-    elif re.search(r'\b(last name|surname|family name|lastname)\b', text_lower):
-        return "Last Name"
-    elif re.search(r'\b(email|e-mail|email address|contact.*email)\b', text_lower):
-        return "E-Mail"
-    elif re.search(r'\b(phone|telephone|mobile|contact.*number)\b', text_lower):
-        return "Phone Number"
-    elif re.search(r'\b(pin|passport|id number|identification|social security)\b', text_lower):
-        return "PIN/Passport"
-    elif re.search(r'\b(age|how old|birth year|born in)\b', text_lower):
-        return "Age"
-    elif re.search(r'\b(gender|sex|male|female|identify as)\b', text_lower):
-        return "Gender"
-    elif re.search(r'\b(city|town|municipality|where.*live|location.*city)\b', text_lower):
-        return "City"
-    elif re.search(r'\b(country|nation|nationality|where.*from|citizenship)\b', text_lower):
-        return "Country"
-    elif re.search(r'\b(region|state|province|area|district)\b', text_lower):
-        return "Region"
-    elif re.search(r'\b(location|address|where.*located|postal code|zip code)\b', text_lower):
-        return "Location"
-    elif re.search(r'\b(company|organization|employer|work for|employed by)\b', text_lower):
-        return "Company"
-    elif re.search(r'\b(title|position|role|job title|designation)\b', text_lower):
-        return "Title/Role"
-    elif re.search(r'\b(education|degree|qualification|university|college|school)\b', text_lower):
-        return "Education level"
-    else:
-        return "Other Identity"
+    # Check each identity type
+    for identity_type, patterns in IDENTITY_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, text_lower):
+                return identity_type
+    
+    return "Not Identity"
 
 def convert_uid_to_3_chars(uid):
-    """Convert UID to 3-character format using Google Sheets formula logic"""
+    """Convert UID to 3-character format following Google Sheets logic"""
     if pd.isna(uid) or uid == "":
         return uid
     
     uid_str = str(uid).strip()
-    
-    # If already 3 characters, return as is
     if len(uid_str) == 3:
         return uid_str
-    
-    # If less than 3 characters, pad with zeros
-    if len(uid_str) < 3:
+    elif len(uid_str) < 3:
         return uid_str.zfill(3)
-    
-    # If more than 3 characters, take first 3
-    return uid_str[:3]
+    else:
+        return uid_str[:3]
 
 @st.cache_data(ttl=CACHE_TTL)
 def get_tfidf_vectors(df_reference):
@@ -250,118 +224,35 @@ def get_comprehensive_question_bank_from_snowflake(
         if engine is None:
             return pd.DataFrame()
         
-        # Base conditions with CALA filter
+        # Base conditions with CALA filter - remove any questions containing CALA
         base_conditions = """
         WHERE HEADING_0 IS NOT NULL 
         AND TRIM(HEADING_0) != ''
         AND UPPER(HEADING_0) NOT LIKE '%CALA%'
+        AND UPPER(COALESCE(CHOICE_TEXT, '')) NOT LIKE '%CALA%'
         """
         
-        # Check what columns exist for choices
-        columns_query = """
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_schema = 'DBT_SURVEY_MONKEY' 
-        AND table_name = 'SURVEY_DETAILS_RESPONSES_COMBINED_LIVE'
-        AND (column_name LIKE '%CHOICE%' OR column_name LIKE '%TEXT%')
-        ORDER BY column_name
-        """
-        
-        with engine.connect() as conn:
-            columns_result = pd.read_sql(text(columns_query), conn)
-        
-        # Determine choice column
-        choice_column = "CHOICE_TEXT"  # Default
-        if not columns_result.empty:
-            # Handle case-insensitive column names
-            column_name_col = 'column_name' if 'column_name' in columns_result.columns else 'COLUMN_NAME'
-            choice_cols = columns_result[column_name_col].tolist()
-            if 'CHOICE_TEXT' in choice_cols:
-                choice_column = "CHOICE_TEXT"
-            elif 'ROW_TEXT' in choice_cols:
-                choice_column = "ROW_TEXT"
-            else:
-                choice_column = choice_cols[0] if choice_cols else "CHOICE_TEXT"
-        
-        # Add survey stage filter if specified and stages exist
+        # Add survey stage filter if specified
         stage_filter = ""
-        available_stages = get_survey_stage_options()
-        if survey_stages and len(survey_stages) > 0 and available_stages:
+        if survey_stages and len(survey_stages) > 0:
             stages_str = "', '".join(survey_stages)
-            # Use the first available stage column
-            stage_col_query = """
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_schema = 'DBT_SURVEY_MONKEY' 
-            AND table_name = 'SURVEY_DETAILS_RESPONSES_COMBINED_LIVE'
-            AND column_name LIKE '%STAGE%'
-            LIMIT 1
-            """
-            with engine.connect() as conn:
-                stage_col_result = pd.read_sql(text(stage_col_query), conn)
-            
-            if not stage_col_result.empty:
-                # Handle case-insensitive column names
-                stage_column_col = 'column_name' if 'column_name' in stage_col_result.columns else 'COLUMN_NAME'
-                stage_column = stage_col_result.iloc[0][stage_column_col]
-                stage_filter = f" AND {stage_column} IN ('{stages_str}')"
+            stage_filter = f" AND SURVEY_STAGE IN ('{stages_str}')"
         
         if grouped_by_stage:
-            # Grouped by survey stage (original behavior)
-            if include_choices:
-                query = f"""
-                WITH ranked_data AS (
-                    SELECT 
-                        HEADING_0,
-                        COALESCE({choice_column}, '') as CHOICE_TEXT,
-                        UID,
-                        DATE_MODIFIED,
-                        COUNT(*) as FREQUENCY,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY HEADING_0, COALESCE({choice_column}, '') 
-                            ORDER BY DATE_MODIFIED DESC, COUNT(*) DESC
-                        ) as rn
-                    FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
-                    {base_conditions}{stage_filter}
-                    GROUP BY HEADING_0, COALESCE({choice_column}, ''), UID, DATE_MODIFIED
-                )
-                SELECT 
-                    HEADING_0 as QUESTION_TEXT,
-                    CASE WHEN CHOICE_TEXT = '' THEN NULL ELSE CHOICE_TEXT END as CHOICE_TEXT,
-                    UID,
-                    FREQUENCY,
-                    DATE_MODIFIED
-                FROM ranked_data 
-                WHERE rn = 1
-                ORDER BY UID, FREQUENCY DESC
-                LIMIT {limit}
-                """
-            else:
-                query = f"""
-                WITH ranked_data AS (
-                    SELECT 
-                        HEADING_0,
-                        UID,
-                        DATE_MODIFIED,
-                        COUNT(*) as FREQUENCY,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY HEADING_0 
-                            ORDER BY DATE_MODIFIED DESC, COUNT(*) DESC
-                        ) as rn
-                    FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
-                    {base_conditions}{stage_filter}
-                    GROUP BY HEADING_0, UID, DATE_MODIFIED
-                )
-                SELECT 
-                    HEADING_0 as QUESTION_TEXT,
-                    UID,
-                    FREQUENCY,
-                    DATE_MODIFIED
-                FROM ranked_data 
-                WHERE rn = 1
-                ORDER BY UID, FREQUENCY DESC
-                LIMIT {limit}
-                """
+            # For grouped by stage (grouped_by_stage=True), maintain stage grouping  
+            query = f"""
+            SELECT 
+                HEADING_0 as QUESTION_TEXT,
+                COALESCE(CHOICE_TEXT, '') as CHOICE_TEXT,
+                UID,
+                SURVEY_STAGE,
+                COUNT(*) as FREQUENCY
+            FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
+            {base_conditions}
+            GROUP BY HEADING_0, COALESCE(CHOICE_TEXT, ''), UID, SURVEY_STAGE
+            ORDER BY UID, FREQUENCY DESC
+            LIMIT {limit}
+            """
         else:
             # Unique questions across all stages (new behavior)
             if include_choices:
@@ -369,24 +260,24 @@ def get_comprehensive_question_bank_from_snowflake(
                 WITH ranked_data AS (
                     SELECT 
                         HEADING_0,
-                        COALESCE({choice_column}, '') as CHOICE_TEXT,
+                        COALESCE(CHOICE_TEXT, '') as CHOICE_TEXT,
                         UID,
-                        DATE_MODIFIED,
-                        COUNT(*) as FREQUENCY,
+                        MAX(SURVEY_STAGE) as LATEST_STAGE,
+                        SUM(1) as TOTAL_FREQUENCY,
                         ROW_NUMBER() OVER (
-                            PARTITION BY HEADING_0, COALESCE({choice_column}, '') 
-                            ORDER BY DATE_MODIFIED DESC, COUNT(*) DESC
+                            PARTITION BY HEADING_0, COALESCE(CHOICE_TEXT, '') 
+                            ORDER BY MAX(DATE_MODIFIED) DESC, SUM(1) DESC
                         ) as rn
                     FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
                     {base_conditions}{stage_filter}
-                    GROUP BY HEADING_0, COALESCE({choice_column}, ''), UID, DATE_MODIFIED
+                    GROUP BY HEADING_0, COALESCE(CHOICE_TEXT, ''), UID
                 )
                 SELECT 
                     HEADING_0 as QUESTION_TEXT,
                     CASE WHEN CHOICE_TEXT = '' THEN NULL ELSE CHOICE_TEXT END as CHOICE_TEXT,
                     UID,
-                    FREQUENCY,
-                    DATE_MODIFIED
+                    LATEST_STAGE as SURVEY_STAGE,
+                    TOTAL_FREQUENCY as FREQUENCY
                 FROM ranked_data 
                 WHERE rn = 1
                 ORDER BY UID, FREQUENCY DESC
@@ -398,21 +289,23 @@ def get_comprehensive_question_bank_from_snowflake(
                     SELECT 
                         HEADING_0,
                         UID,
-                        DATE_MODIFIED,
-                        COUNT(*) as FREQUENCY,
+                        MAX(DATE_MODIFIED) as LATEST_MODIFIED,
+                        MAX(SURVEY_STAGE) as LATEST_STAGE,
+                        SUM(1) as TOTAL_FREQUENCY,
                         ROW_NUMBER() OVER (
                             PARTITION BY HEADING_0 
-                            ORDER BY DATE_MODIFIED DESC, COUNT(*) DESC
+                            ORDER BY MAX(DATE_MODIFIED) DESC, SUM(1) DESC
                         ) as rn
                     FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
                     {base_conditions}{stage_filter}
-                    GROUP BY HEADING_0, UID, DATE_MODIFIED
+                    GROUP BY HEADING_0, UID
                 )
                 SELECT 
                     HEADING_0 as QUESTION_TEXT,
                     UID,
-                    FREQUENCY,
-                    DATE_MODIFIED
+                    LATEST_STAGE as SURVEY_STAGE,
+                    TOTAL_FREQUENCY as FREQUENCY,
+                    LATEST_MODIFIED as DATE_MODIFIED
                 FROM ranked_data 
                 WHERE rn = 1
                 ORDER BY UID, FREQUENCY DESC
@@ -423,9 +316,34 @@ def get_comprehensive_question_bank_from_snowflake(
             result_df = pd.read_sql(text(query), conn)
         
         if not result_df.empty:
+            # Handle column name variations (Snowflake returns lowercase)
+            column_mapping = {}
+            for col in result_df.columns:
+                col_upper = col.upper()
+                if col_upper == 'QUESTION_TEXT':
+                    column_mapping['QUESTION_TEXT'] = col
+                elif col_upper == 'CHOICE_TEXT':
+                    column_mapping['CHOICE_TEXT'] = col
+                elif col_upper == 'UID':
+                    column_mapping['UID'] = col
+                elif col_upper == 'SURVEY_STAGE':
+                    column_mapping['SURVEY_STAGE'] = col
+                elif col_upper == 'FREQUENCY':
+                    column_mapping['FREQUENCY'] = col
+            
+            # Rename columns to standardized uppercase names
+            for standard_name, actual_name in column_mapping.items():
+                if actual_name in result_df.columns:
+                    result_df = result_df.rename(columns={actual_name: standard_name})
+            
             # Add identity detection columns
-            result_df['IS_IDENTITY'] = result_df['QUESTION_TEXT'].apply(contains_identity_info)
-            result_df['IDENTITY_TYPE'] = result_df['QUESTION_TEXT'].apply(determine_identity_type)
+            if 'QUESTION_TEXT' in result_df.columns:
+                result_df['IS_IDENTITY'] = result_df['QUESTION_TEXT'].apply(contains_identity_info)
+                result_df['IDENTITY_TYPE'] = result_df['QUESTION_TEXT'].apply(determine_identity_type)
+            
+            # Convert UIDs to 3-character format
+            if 'UID' in result_df.columns:
+                result_df['UID'] = result_df['UID'].apply(convert_uid_to_3_chars)
             
             logger.info(f"✅ Retrieved {len(result_df)} question-choice combinations from Snowflake")
         
@@ -443,48 +361,41 @@ def get_survey_stage_options():
         if engine is None:
             return []
         
-        # First, let's check what columns actually exist
-        columns_query = """
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_schema = 'DBT_SURVEY_MONKEY' 
-        AND table_name = 'SURVEY_DETAILS_RESPONSES_COMBINED_LIVE'
-        AND column_name LIKE '%STAGE%'
-        ORDER BY column_name
+        # Direct query since we know the column name is SURVEY_STAGE
+        query = """
+        SELECT DISTINCT SURVEY_STAGE, COUNT(*) as count
+        FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
+        WHERE SURVEY_STAGE IS NOT NULL 
+        AND TRIM(SURVEY_STAGE) != ''
+        AND UPPER(HEADING_0) NOT LIKE '%CALA%'
+        GROUP BY SURVEY_STAGE
+        ORDER BY count DESC
         """
         
         with engine.connect() as conn:
-            columns_result = pd.read_sql(text(columns_query), conn)
+            result_df = pd.read_sql(text(query), conn)
             
-        # Check if we have any stage-related columns
-        if not columns_result.empty:
-            # Handle case-insensitive column names
-            column_name_col = 'column_name' if 'column_name' in columns_result.columns else 'COLUMN_NAME'
-            stage_column = columns_result.iloc[0][column_name_col]
-            
-            query = f"""
-            SELECT DISTINCT {stage_column}
-            FROM AMI_DBT.DBT_SURVEY_MONKEY.SURVEY_DETAILS_RESPONSES_COMBINED_LIVE
-            WHERE {stage_column} IS NOT NULL 
-            AND TRIM({stage_column}) != ''
-            AND UPPER(HEADING_0) NOT LIKE '%CALA%'
-            ORDER BY {stage_column}
-            """
-            
-            with engine.connect() as conn:
-                result_df = pd.read_sql(text(query), conn)
-                
-            stages = result_df[stage_column].tolist() if not result_df.empty else []
-            logger.info(f"✅ Retrieved {len(stages)} survey stages from Snowflake")
-            return stages
+        # Handle lowercase column names returned by Snowflake
+        if 'survey_stage' in result_df.columns:
+            stages = result_df['survey_stage'].tolist()
+        elif 'SURVEY_STAGE' in result_df.columns:
+            stages = result_df['SURVEY_STAGE'].tolist()
         else:
-            # Fallback: try to derive stages from survey titles or other data
-            logger.warning("No STAGE column found, using fallback method")
-            return ["AP Survey", "Annual Impact Survey"]  # Based on your previous findings
+            stages = []
+            
+        if stages:
+            logger.info(f"✅ Retrieved {len(stages)} survey stages from Snowflake: {stages}")
+        return stages
         
     except Exception as e:
         logger.error(f"Failed to get survey stage options: {str(e)}")
-        return ["AP Survey", "Annual Impact Survey"]  # Fallback
+        # Return the known stages as fallback
+        return [
+            "Annual Impact Survey", "Pre-Programme Survey", "Enrollment/Application Survey",
+            "Progress Review Survey", "Other", "Growth Goal Reflection", "Change Challenge Survey",
+            "Pulse Check Survey", "LL Feedback Survey", "AP Survey", "CEO/Client Lead Survey",
+            "Longitudinal Survey"
+        ]
 
 @st.cache_data(ttl=CACHE_TTL)
 def get_snowflake_analytics():
@@ -668,371 +579,680 @@ def run_snowflake_optimized_matching(question_bank_df, target_questions_df):
 
 # ============= STREAMLIT UI FUNCTIONS =============
 
-def show_snowflake_question_bank_builder():
-    """Enhanced question bank builder using Snowflake with original UI structure"""
+def show_grouped_question_bank_builder():
+    """Show question bank builder grouped by survey stages"""
+    st.header("🏗️ Question Bank Builder (Grouped by Survey Stages)")
+    st.markdown("*Build question banks organized by survey stages for client-specific modifications*")
     
-    st.header("🏗️ Snowflake-Optimized Question Bank Builder")
-    st.markdown("*Build comprehensive question banks directly from Snowflake data*")
+    st.markdown('<div class="data-source-info">❄️ <strong>Data Source:</strong> Snowflake - Survey responses grouped by survey stage</div>', unsafe_allow_html=True)
     
-    # Sidebar filters - maintaining original structure
-    with st.sidebar:
-        st.subheader("🎛️ Filters & Configuration")
-        
-        # Question bank type selection (NEW)
-        st.markdown("**📊 Question Bank Type**")
-        bank_type = st.radio(
-            "Select question bank type:",
-            options=["Grouped by Survey Stage", "Unique Questions (All Stages)"],
-            help="""
-            • **Grouped by Survey Stage**: Questions organized by survey stage - useful for client-specific modifications
-            • **Unique Questions**: Deduplicated questions across all stages - prevents duplicate UIDs and questions
-            """
-        )
-        
-        grouped_by_stage = (bank_type == "Grouped by Survey Stage")
-        
-        st.markdown("---")
-        
-        # Survey stage filter with multi-select dropdown (UPDATED)
+    # Configuration
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Survey stage selection 
         available_stages = get_survey_stage_options()
         if available_stages:
-            # Add "All" option
-            stage_options = ["All"] + available_stages
-            selected_stage_option = st.selectbox(
-                "Survey Stage Selection",
-                options=stage_options,
-                help="Select 'All' for all stages or choose specific stages"
+            selected_stages = st.multiselect(
+                "📊 Select Survey Stages",
+                available_stages,
+                default=available_stages[:3] if len(available_stages) >= 3 else available_stages,
+                help="Choose which survey stages to include in the question bank"
             )
-            
-            if selected_stage_option == "All":
-                selected_stages = available_stages
-                st.info(f"✅ All {len(available_stages)} survey stages selected")
-            else:
-                # Allow additional selections
-                additional_stages = st.multiselect(
-                    "Additional Survey Stages (optional)",
-                    options=[s for s in available_stages if s != selected_stage_option],
-                    help="Select additional survey stages to include"
-                )
-                selected_stages = [selected_stage_option] + additional_stages
-                st.info(f"✅ {len(selected_stages)} survey stage(s) selected")
         else:
-            selected_stages = []
-            st.warning("⚠️ No survey stages available")
-        
-        # Question scope settings
-        include_choices = st.checkbox(
-            "Include Choice Text", 
-            value=True,
-            help="Include answer choices for multi-choice questions"
-        )
-        
-        # Query limit
-        query_limit = st.slider(
-            "Query Limit", 
-            min_value=100, 
-            max_value=50000, 
-            value=SNOWFLAKE_QUERY_LIMIT,
-            step=500,
-            help="Maximum number of records to retrieve"
-        )
-
-        # Build button
-        build_bank = st.button("🚀 Build Question Bank", type="primary")
-
-    # Main content - maintaining original structure
-    if build_bank:
+            st.error("❌ No survey stages available")
+            return
+    
+    with col2:
+        # Advanced options
+        st.subheader("⚙️ Options")
+        limit = st.number_input("🔢 Record Limit", min_value=1000, max_value=50000, value=25000)
+        include_choices = st.checkbox("📝 Include Choice Text", value=True)
+    
+    # Build button
+    if st.button("🚀 Build Grouped Question Bank", type="primary", key="build_grouped"):
         if not selected_stages:
             st.error("❌ Please select at least one survey stage")
             return
-            
-        with st.spinner(f"Building {'grouped' if grouped_by_stage else 'unique'} question bank from Snowflake..."):
-            # Get question bank
+        
+        with st.spinner("🔄 Building grouped question bank from Snowflake..."):
+            # Force grouped mode
             question_bank_df = get_comprehensive_question_bank_from_snowflake(
-                limit=query_limit,
+                limit=limit,
                 survey_stages=selected_stages,
                 include_choices=include_choices,
-                grouped_by_stage=grouped_by_stage
+                grouped_by_stage=True  # Force grouped mode
             )
             
-        if not question_bank_df.empty:
+            if question_bank_df.empty:
+                st.error("❌ Failed to build question bank. Please check your filters and try again.")
+                return
+            
             # Store in session state
-            st.session_state.question_bank_snowflake = question_bank_df
-            st.session_state.question_bank_type = bank_type
+            st.session_state.question_bank_grouped = question_bank_df
+            st.session_state.question_bank_type = "Grouped by Survey Stage"
             
-            # Display summary - maintaining original style
-            st.success(f"✅ Built {bank_type.lower()} with {len(question_bank_df):,} records")
+            # Display overview
+            st.success(f"✅ Built grouped question bank with {len(question_bank_df):,} records")
             
-            # Summary metrics - maintaining original structure
+            # Data preview grouped by survey stage
+            st.subheader("📊 Question Bank Preview")
+            
+            # Get correct column names (handle case variations)
+            cols = question_bank_df.columns.str.lower().tolist()
+            question_col = None
+            choice_col = None
+            uid_col = None
+            stage_col = None
+            
+            for col in question_bank_df.columns:
+                col_lower = col.lower()
+                if 'question' in col_lower or 'heading' in col_lower:
+                    question_col = col
+                elif 'choice' in col_lower:
+                    choice_col = col
+                elif col_lower == 'uid':
+                    uid_col = col
+                elif 'stage' in col_lower:
+                    stage_col = col
+            
+            if stage_col and question_col:
+                # Group by survey stage
+                for stage in question_bank_df[stage_col].unique():
+                    stage_data = question_bank_df[question_bank_df[stage_col] == stage]
+                    
+                    with st.expander(f"📋 {stage} ({len(stage_data)} questions)"):
+                        # Show columns that exist
+                        display_cols = []
+                        if question_col: display_cols.append(question_col)
+                        if choice_col: display_cols.append(choice_col)
+                        if uid_col: display_cols.append(uid_col)
+                        
+                        if display_cols:
+                            st.dataframe(
+                                stage_data[display_cols].head(20).fillna(''),
+                                use_container_width=True
+                            )
+                        else:
+                            st.dataframe(stage_data.head(20), use_container_width=True)
+            else:
+                # Fallback display
+                st.dataframe(question_bank_df.head(100), use_container_width=True)
+
+def show_unique_question_bank_builder():
+    """Show question bank builder for unique questions across all stages"""
+    st.header("🔍 Question Bank Builder (Unique Questions)")
+    st.markdown("*Build question banks with unique questions across all stages - prevents duplicate UIDs*")
+    
+    st.markdown('<div class="data-source-info">❄️ <strong>Data Source:</strong> Snowflake - Deduplicated questions showing most recent UID assignment</div>', unsafe_allow_html=True)
+    
+    # Configuration
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Survey stage selection (optional for filtering)
+        available_stages = get_survey_stage_options()
+        if available_stages:
+            selected_stages = st.multiselect(
+                "📊 Filter by Survey Stages (Optional)",
+                available_stages,
+                default=[],
+                help="Optional: Filter questions by specific stages, or leave empty for all stages"
+            )
+            
+            if not selected_stages:
+                selected_stages = available_stages  # Use all if none selected
+        else:
+            st.error("❌ No survey stages available")
+            return
+    
+    with col2:
+        # Advanced options
+        st.subheader("⚙️ Options")
+        limit = st.number_input("🔢 Record Limit", min_value=1000, max_value=50000, value=25000, key="unique_limit")
+        include_choices = st.checkbox("📝 Include Choice Text", value=True, key="unique_choices")
+    
+    # Build button
+    if st.button("🚀 Build Unique Question Bank", type="primary", key="build_unique"):
+        with st.spinner("🔄 Building unique question bank from Snowflake..."):
+            # Force unique mode
+            question_bank_df = get_comprehensive_question_bank_from_snowflake(
+                limit=limit,
+                survey_stages=selected_stages,
+                include_choices=include_choices,
+                grouped_by_stage=False  # Force unique mode
+            )
+            
+            if question_bank_df.empty:
+                st.error("❌ Failed to build question bank. Please check your filters and try again.")
+                return
+            
+            # Store in session state
+            st.session_state.question_bank_unique = question_bank_df
+            st.session_state.question_bank_type = "Unique Questions (All Stages)"
+            
+            # Display overview
+            st.success(f"✅ Built unique question bank with {len(question_bank_df):,} records")
+            
+            # Data preview - flat list without grouping
+            st.subheader("🔍 Unique Questions Preview")
+            
+            # Get correct column names (handle case variations)
+            question_col = None
+            choice_col = None
+            uid_col = None
+            stage_col = None
+            freq_col = None
+            
+            for col in question_bank_df.columns:
+                col_lower = col.lower()
+                if 'question' in col_lower or 'heading' in col_lower:
+                    question_col = col
+                elif 'choice' in col_lower:
+                    choice_col = col
+                elif col_lower == 'uid':
+                    uid_col = col
+                elif 'stage' in col_lower:
+                    stage_col = col
+                elif 'freq' in col_lower:
+                    freq_col = col
+            
+            # Show sample of questions in flat format
+            display_cols = []
+            if question_col: display_cols.append(question_col)
+            if choice_col: display_cols.append(choice_col)
+            if uid_col: display_cols.append(uid_col)
+            if stage_col: display_cols.append(stage_col)
+            if freq_col: display_cols.append(freq_col)
+            
+            if display_cols:
+                preview_df = question_bank_df[display_cols].head(100).fillna('')
+            else:
+                preview_df = question_bank_df.head(100).fillna('')
+            
+            # Add search functionality
+            search_term = st.text_input("🔍 Search questions:", key="search_unique_questions")
+            if search_term and question_col:
+                mask = preview_df[question_col].astype(str).str.contains(search_term, case=False, na=False)
+                preview_df = preview_df[mask]
+            
+            st.dataframe(
+                preview_df,
+                use_container_width=True,
+                height=400
+            )
+            
+            # Show summary stats
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Records", len(question_bank_df))
+            with col2:
+                if question_col:
+                    unique_questions = question_bank_df[question_col].nunique()
+                    st.metric("Unique Questions", unique_questions)
+            with col3:
+                if stage_col:
+                    stage_count = question_bank_df[stage_col].nunique()
+                    st.metric("Survey Stages", stage_count)
+            with col4:
+                if uid_col:
+                    uid_count = question_bank_df[uid_col].nunique()
+                    st.metric("Unique UIDs", uid_count)
+
+# ============= MAIN APPLICATION =============
+def main():
+    """Main Streamlit application with sidebar navigation"""
+    
+    st.title("❄️ Snowflake UID Management System")
+    
+    # Sidebar navigation - organized by workflow
+    with st.sidebar:
+        st.header("🧭 Workflow Navigation")
+        st.markdown("*Follow the workflow steps in order:*")
+        
+        # Handle query parameter navigation
+        query_page = st.query_params.get("page", "")
+        if query_page == "step1a":
+            default_index = 1
+        elif query_page == "step1b":
+            default_index = 2
+        elif query_page == "step2":
+            default_index = 3
+        elif query_page == "step3":
+            default_index = 4
+        elif query_page == "step4":
+            default_index = 5
+        else:
+            default_index = 0
+        
+        page = st.radio(
+            "Select workflow step:",
+            [
+                "🏠 Home Dashboard", 
+                "**Step 1A:** 🏗️ Question Bank (Grouped by Stage)",
+                "**Step 1B:** 🔍 Question Bank (Unique Questions)",
+                "**Step 2:** 📊 Survey Selection", 
+                "**Step 3:** 🎯 UID Matching",
+                "**Step 4:** 📤 Export Results"
+            ],
+            index=default_index,
+            key="main_navigation"
+        )
+        
+        # Workflow guidance
+        st.markdown("---")
+        st.markdown("### 📋 Workflow Guide")
+        st.markdown("""
+        **1. Question Bank Builder**  
+        Build comprehensive question banks from Snowflake data
+        
+        **2. Survey Selection**  
+        Select SurveyMonkey surveys to extract questions
+        
+        **3. UID Matching**  
+        Match survey questions to question bank UIDs
+        
+        **4. Export Results**  
+        Export matched data with identity classification
+        """)
+    
+    # Route to appropriate page
+    if page == "🏠 Home Dashboard":
+        show_home_dashboard()
+    elif page == "**Step 1A:** 🏗️ Question Bank (Grouped by Stage)":
+        show_grouped_question_bank_builder()
+    elif page == "**Step 1B:** 🔍 Question Bank (Unique Questions)":
+        show_unique_question_bank_builder()
+    elif page == "**Step 2:** 📊 Survey Selection":
+        show_survey_selection()
+    elif page == "**Step 3:** 🎯 UID Matching":
+        show_snowflake_matching()
+    elif page == "**Step 4:** 📤 Export Results":
+        show_snowflake_export()
+
+def show_home_dashboard():
+    """Show enhanced home dashboard with workflow guidance"""
+    st.header("🏠 Home Dashboard")
+    st.markdown("*Welcome to the Snowflake UID Management System*")
+    
+    # System status
+    st.markdown("### 📊 System Status")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        try:
+            stages = get_survey_stage_options()
+            st.success(f"✅ Snowflake Connected - {len(stages)} survey stages available")
+        except:
+            st.error("❌ Snowflake Connection Failed")
+    
+    with col2:
+        try:
+            headers = {"Authorization": f"Bearer {st.secrets['surveymonkey']['access_token']}"}
+            st.success("✅ SurveyMonkey Connected")
+        except:
+            st.error("❌ SurveyMonkey Connection Failed")
+    
+    st.markdown("---")
+    
+    # Workflow steps
+    st.markdown("### 🚀 Quick Start Workflow")
+    
+    # Step 1A: Grouped Question Bank
+    with st.expander("**Step 1A: 🏗️ Grouped Question Bank**"):
+        st.markdown("""
+        **Purpose:** Build question banks organized by survey stages
+        
+        **What you'll do:**
+        - Select specific survey stages to include
+        - Build question banks grouped by stage for client-specific modifications
+        - Questions retain their survey stage context
+        - Ideal for stage-specific analysis and modifications
+        
+        **Output:** Question bank with stage groupings
+        """)
+        
+        if st.button("🚀 Start Step 1A: Grouped Question Bank", type="primary", key="step1a"):
+            st.query_params["page"] = "step1a"
+            st.rerun()
+    
+    # Step 1B: Unique Question Bank  
+    with st.expander("**Step 1B: 🔍 Unique Question Bank**"):
+        st.markdown("""
+        **Purpose:** Build deduplicated question banks across all stages
+        
+        **What you'll do:**
+        - Extract unique questions from all survey stages
+        - Prevent duplicate UIDs across different stages
+        - Shows most recent UID assignment for each question
+        - Ideal for comprehensive UID management
+        
+        **Output:** Flat list of unique questions with latest UIDs
+        """)
+        
+        if st.button("🚀 Start Step 1B: Unique Question Bank", type="primary", key="step1b"):
+            st.query_params["page"] = "step1b"
+            st.rerun()
+    
+    # Step 2: Survey Selection
+    with st.expander("**Step 2: 📊 Survey Selection**"):
+        st.markdown("""
+        **Purpose:** Select SurveyMonkey surveys to extract questions from
+        
+        **What you'll do:**
+        - Browse available SurveyMonkey surveys
+        - Select specific surveys for question extraction
+        - Extract questions and choices from selected surveys
+        - Review extracted question data
+        
+        **Prerequisites:** Complete Step 1 (Question Bank)
+        **Output:** Target questions for UID matching
+        """)
+        
+        if st.button("➡️ Start Step 2: Select Surveys", key="step2"):
+            st.query_params["page"] = "step2"
+            st.rerun()
+    
+    # Step 3: UID Matching
+    with st.expander("**Step 3: 🎯 UID Matching**"):
+        st.markdown("""
+        **Purpose:** Match survey questions to question bank UIDs
+        
+        **What you'll do:**
+        - Run TF-IDF and semantic matching algorithms
+        - Review match confidence levels (High/Low/No match)
+        - Handle identity questions automatically (16 identity types)
+        - Resolve conflicts and duplicates
+        
+        **Prerequisites:** Complete Steps 1 & 2
+        **Output:** Questions with assigned UIDs and match types
+        """)
+        
+        if st.button("🎯 Start Step 3: UID Matching", key="step3"):
+            st.query_params["page"] = "step3"
+            st.rerun()
+    
+    # Step 4: Export Results
+    with st.expander("**Step 4: 📤 Export Results**"):
+        st.markdown("""
+        **Purpose:** Export matched data with identity classification
+        
+        **What you'll do:**
+        - Review final matched results
+        - Download CSV/Excel exports
+        - Separate identity vs non-identity questions
+        - Generate comprehensive reports
+        
+        **Prerequisites:** Complete Steps 1, 2 & 3
+        **Output:** Final export files ready for use
+        """)
+        
+        if st.button("📊 Start Step 4: Export Results", key="step4"):
+            st.query_params["page"] = "step4"
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Recent Analytics
+    try:
+        analytics = get_snowflake_analytics()
+        if analytics:
+            st.markdown("### 📈 Quick Analytics")
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                unique_questions = question_bank_df['QUESTION_TEXT'].nunique()
-                st.metric("Unique Questions", f"{unique_questions:,}")
-            
+                st.metric("Total Questions", f"{analytics.get('total_questions', 0):,}")
             with col2:
-                if 'CHOICE_TEXT' in question_bank_df.columns:
-                    choice_count = question_bank_df['CHOICE_TEXT'].notna().sum()
-                    st.metric("Questions with Choices", f"{choice_count:,}")
-                else:
-                    st.metric("Main Questions Only", f"{len(question_bank_df):,}")
-            
+                st.metric("Survey Stages", f"{analytics.get('survey_stages', 0)}")
             with col3:
-                unique_uids = question_bank_df['UID'].nunique()
-                st.metric("Unique UIDs", unique_uids)
-            
+                st.metric("Unique UIDs", f"{analytics.get('unique_uids', 0):,}")
             with col4:
-                identity_count = question_bank_df['IS_IDENTITY'].sum() if 'IS_IDENTITY' in question_bank_df.columns else 0
-                st.metric("Identity Questions", identity_count)
+                st.metric("Data Records", f"{analytics.get('total_records', 0):,}")
+    except Exception as e:
+        st.info("💡 Analytics will be available once Snowflake data is loaded")
 
-            # Display breakdown by survey stage - maintaining original approach
-            if 'SURVEY_STAGE' in question_bank_df.columns:
-                st.subheader("📊 Breakdown by Survey Stage")
-                stage_summary = question_bank_df.groupby('SURVEY_STAGE').agg({
-                    'QUESTION_TEXT': 'count',
-                    'UID': 'nunique',
-                    'FREQUENCY': 'sum' if 'FREQUENCY' in question_bank_df.columns else 'count'
-                }).round().astype(int)
-                
-                # Rename columns for clarity
-                stage_summary.columns = ['Total Records', 'Unique UIDs', 'Total Usage']
-                st.dataframe(stage_summary, use_container_width=True)
-
-            # Sample data preview - maintaining original approach
-            st.subheader("🔍 Sample Data Preview")
-            
-            # Select columns to display
-            preview_cols = ['QUESTION_TEXT']
-            if 'CHOICE_TEXT' in question_bank_df.columns:
-                preview_cols.append('CHOICE_TEXT')
-            preview_cols.extend(['UID', 'UID_3_CHAR'])
-            if 'SURVEY_STAGE' in question_bank_df.columns:
-                preview_cols.append('SURVEY_STAGE')
-            if 'IS_IDENTITY' in question_bank_df.columns:
-                preview_cols.extend(['IS_IDENTITY', 'IDENTITY_TYPE'])
-            if 'FREQUENCY' in question_bank_df.columns:
-                preview_cols.append('FREQUENCY')
-            
-            # Filter to available columns
-            available_cols = [col for col in preview_cols if col in question_bank_df.columns]
-            
-            st.dataframe(question_bank_df[available_cols].head(20), use_container_width=True)
-            
-        else:
-            st.error("❌ Failed to build question bank. Please check your filters and try again.")
+def show_survey_selection():
+    """Show SurveyMonkey survey selection page (like original uid_promax10.py)"""
+    st.header("📋 Survey Selection & Question Bank")
+    st.markdown("*Select SurveyMonkey surveys to extract questions from*")
     
-    # Analytics section - maintaining original structure
-    st.subheader("📈 Snowflake Data Analytics")
+    st.markdown('<div class="data-source-info">📊 <strong>Data Source:</strong> SurveyMonkey API - Survey selection and question extraction</div>', unsafe_allow_html=True)
     
-    if st.button("📊 Load Analytics"):
-        with st.spinner("Loading Snowflake analytics..."):
-            analytics = get_snowflake_analytics()
+    # Get SurveyMonkey token and check connection
+    try:
+        token = st.secrets["surveymonkey"]["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
         
-        if analytics:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Total Records", f"{analytics.get('TOTAL_RECORDS', 0):,}")
-                st.metric("Unique Questions", f"{analytics.get('UNIQUE_QUESTIONS', 0):,}")
-            
-            with col2:
-                st.metric("Unique Choices", f"{analytics.get('UNIQUE_CHOICES', 0):,}")
-                st.metric("Unique UIDs", analytics.get('UNIQUE_UIDS', 0))
-            
-            with col3:
-                st.metric("Survey Stages", analytics.get('SURVEY_STAGES', 0))
-                st.metric("UID Coverage", f"{analytics.get('UID_COVERAGE_PERCENT', 0):.1f}%")
-
-def show_snowflake_matching():
-    """Enhanced matching interface using Snowflake question bank"""
-    
-    st.header("🎯 Snowflake-Optimized UID Matching")
-    st.markdown("*Match target questions against comprehensive Snowflake question bank*")
-    
-    # Check if question bank is available
-    if 'question_bank_snowflake' not in st.session_state or st.session_state.question_bank_snowflake.empty:
-        st.warning("⚠️ No Snowflake question bank loaded. Please build one first in the Question Bank Builder tab.")
+        # Test connection
+        response = requests.get("https://api.surveymonkey.com/v3/users/me", headers=headers, timeout=10)
+        if response.status_code != 200:
+            st.error(f"❌ SurveyMonkey connection failed: {response.status_code}")
+            return
+        
+        st.success("✅ SurveyMonkey connection established")
+        
+    except Exception as e:
+        st.error(f"❌ SurveyMonkey connection failed: {e}")
+        st.info("Please check your SurveyMonkey API token in secrets.toml")
         return
     
-    question_bank_df = st.session_state.question_bank_snowflake
-    bank_type = st.session_state.get('question_bank_type', 'Unknown')
-    st.info(f"📊 Using question bank: **{bank_type}** ({len(question_bank_df):,} records)")
+    # Get surveys with caching
+    @st.cache_data(ttl=1800)
+    def get_surveys_cached(token):
+        """Get all surveys from SurveyMonkey API"""
+        try:
+            headers = {"Authorization": f"Bearer {token}"}
+            all_surveys = []
+            page = 1
+            
+            while True:
+                params = {"per_page": 1000, "page": page}
+                response = requests.get("https://api.surveymonkey.com/v3/surveys", 
+                                      headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                page_surveys = data.get("data", [])
+                
+                if not page_surveys:
+                    break
+                    
+                all_surveys.extend(page_surveys)
+                total_surveys = data.get("total", 0)
+                
+                if len(all_surveys) >= total_surveys:
+                    break
+                    
+                page += 1
+                
+            return all_surveys
+            
+        except Exception as e:
+            logger.error(f"Failed to get surveys: {e}")
+            return []
     
-    # File upload for target questions - maintaining original structure
-    st.subheader("📁 Upload Target Questions")
+    # Load surveys
+    with st.spinner("Loading SurveyMonkey surveys..."):
+        surveys = get_surveys_cached(token)
     
-    uploaded_file = st.file_uploader(
-        "Choose CSV file with target questions",
-        type=['csv'],
-        help="CSV should have a 'question_text' column"
+    if not surveys:
+        st.warning("⚠️ No surveys found. Check SurveyMonkey connection.")
+        return
+    
+    st.success(f"✅ Found {len(surveys)} surveys in your SurveyMonkey account")
+    
+    # Survey Selection Interface
+    st.subheader("🔍 Select Surveys to Extract Questions From")
+    
+    # Create survey options
+    survey_options = [f"{s['id']} - {s['title']}" for s in surveys]
+    selected_surveys = st.multiselect(
+        "Choose surveys to analyze:",
+        survey_options,
+        help="Select surveys to extract questions from. Questions will be used for building question bank and UID matching."
     )
     
-    if uploaded_file:
+    # Extract selected survey IDs
+    selected_survey_ids = [s.split(" - ")[0] for s in selected_surveys]
+    
+    if selected_survey_ids:
+        st.info(f"📊 Selected {len(selected_survey_ids)} surveys for processing")
+        
+        # Process button
+        if st.button("🚀 Extract Questions from Selected Surveys", type="primary"):
+            extract_questions_from_surveys(selected_survey_ids, token)
+    
+    # Quick filters for survey selection
+    with st.expander("🎛️ Survey Filters", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Filter by survey title
+            title_filter = st.text_input("Filter by title:", key="survey_title_filter")
+            if title_filter:
+                filtered_surveys = [s for s in surveys if title_filter.lower() in s['title'].lower()]
+                st.info(f"Found {len(filtered_surveys)} surveys matching '{title_filter}'")
+        
+        with col2:
+            # Show survey count
+            st.metric("Total Surveys", len(surveys))
+            
+            # Quick select options
+            if st.button("Select All Template Surveys"):
+                template_surveys = [f"{s['id']} - {s['title']}" for s in surveys if 'template' in s['title'].lower()]
+                st.session_state.survey_multiselect = template_surveys
+                st.rerun()
+
+def extract_questions_from_surveys(survey_ids, token):
+    """Extract questions from selected SurveyMonkey surveys"""
+    
+    @st.cache_data(ttl=600)
+    def get_survey_details_with_retry(survey_id, token):
+        """Get detailed survey information with retry logic"""
         try:
-            target_df = pd.read_csv(uploaded_file)
-            
-            if 'question_text' not in target_df.columns:
-                st.error("❌ CSV must contain a 'question_text' column")
-                return
-            
-            st.success(f"✅ Loaded {len(target_df)} target questions")
-            st.dataframe(target_df.head(), use_container_width=True)
-            
-            # Run matching
-            if st.button("🚀 Start Matching", type="primary"):
-                with st.spinner("Running Snowflake-optimized matching..."):
-                    matched_results = run_snowflake_optimized_matching(question_bank_df, target_df)
-                
-                if not matched_results.empty:
-                    st.session_state.matching_results = matched_results
-                    
-                    # Display results summary - maintaining original structure
-                    total_questions = len(target_df)
-                    matched_questions = matched_results['Final_UID'].notna().sum()
-                    match_rate = (matched_questions / total_questions * 100) if total_questions > 0 else 0
-                    
-                    st.success(f"✅ Matching completed! {matched_questions}/{total_questions} questions matched ({match_rate:.1f}%)")
-                    
-                    # Matching statistics - maintaining original approach
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Total Questions", total_questions)
-                    
-                    with col2:
-                        st.metric("Matched Questions", matched_questions)
-                    
-                    with col3:
-                        unique_uids = matched_results['Final_UID'].nunique()
-                        st.metric("Unique UIDs Found", unique_uids)
-                    
-                    with col4:
-                        identity_matches = 0
-                        if 'IS_IDENTITY' in matched_results.columns:
-                            identity_matches = matched_results['IS_IDENTITY'].sum()
-                        st.metric("Identity Matches", identity_matches)
-                    
-                    # Results preview - maintaining original structure
-                    st.subheader("🎯 Matching Results Preview")
-                    
-                    # Select columns for display
-                    results_cols = ['question_text']
-                    if 'Final_UID' in matched_results.columns:
-                        results_cols.append('Final_UID')
-                    if 'Final_Match_Type' in matched_results.columns:
-                        results_cols.append('Final_Match_Type')
-                    if 'Similarity' in matched_results.columns:
-                        results_cols.append('Similarity')
-                    if 'IS_IDENTITY' in matched_results.columns:
-                        results_cols.extend(['IS_IDENTITY', 'IDENTITY_TYPE'])
-                    
-                    # Filter to available columns
-                    available_cols = [col for col in results_cols if col in matched_results.columns]
-                    
-                    if available_cols:
-                        st.dataframe(matched_results[available_cols].head(20), use_container_width=True)
-                    else:
-                        # Fallback to showing all columns
-                        st.dataframe(matched_results.head(20), use_container_width=True)
-                    
-                else:
-                    st.error("❌ Matching failed")
-                    
+            url = f"https://api.surveymonkey.com/v3/surveys/{survey_id}/details"
+            headers = {"Authorization": f"Bearer {token}"}
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()
         except Exception as e:
-            st.error(f"❌ Error processing file: {e}")
+            logger.error(f"Failed to get survey {survey_id}: {e}")
+            return None
     
-    # Display saved results if available - maintaining original structure
-    if 'matching_results' in st.session_state and not st.session_state.matching_results.empty:
-        st.subheader("💾 Saved Matching Results")
+    def extract_questions_from_json(survey_json):
+        """Extract questions from SurveyMonkey survey JSON"""
+        questions = []
         
-        results_df = st.session_state.matching_results
-        
-        # Enhanced analysis
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**📊 Match Type Distribution**")
-            if 'Final_Match_Type' in results_df.columns:
-                match_type_counts = results_df['Final_Match_Type'].value_counts()
-                for match_type, count in match_type_counts.items():
-                    st.text(f"• {match_type}: {count}")
-        
-        with col2:
-            st.markdown("**🔍 Identity Analysis**")
-            if 'IS_IDENTITY' in results_df.columns:
-                total_identity = results_df['IS_IDENTITY'].sum()
-                total_questions = len(results_df)
-                identity_rate = (total_identity / total_questions * 100) if total_questions > 0 else 0
-                st.text(f"• Identity questions: {total_identity} ({identity_rate:.1f}%)")
+        for page in survey_json.get("pages", []):
+            for question in page.get("questions", []):
+                q_text = question.get("headings", [{}])[0].get("heading", "")
+                q_id = question.get("id", None)
+                family = question.get("family", None)
                 
-                if 'IDENTITY_TYPE' in results_df.columns:
-                    identity_types = results_df[results_df['IS_IDENTITY'] == True]['IDENTITY_TYPE'].value_counts()
-                    for identity_type, count in identity_types.head(5).items():
-                        st.text(f"• {identity_type}: {count}")
-
-def show_snowflake_export():
-    """Export functionality for Snowflake results"""
-    
-    st.header("📤 Export Snowflake Results")
-    st.markdown("*Export question banks and matching results*")
-    
-    # Question bank export
-    if 'snowflake_question_bank' in st.session_state:
-        st.subheader("📊 Question Bank Export")
-        question_bank_df = st.session_state.snowflake_question_bank
+                # Determine schema type
+                if family == "single_choice":
+                    schema_type = "Single Choice"
+                elif family == "multiple_choice":
+                    schema_type = "Multiple Choice"
+                elif family == "open_ended":
+                    schema_type = "Open-Ended"
+                elif family == "matrix":
+                    schema_type = "Matrix"
+                else:
+                    choices = question.get("answers", {}).get("choices", [])
+                    schema_type = "Multiple Choice" if choices else "Open-Ended"
+                
+                # Add main question
+                questions.append({
+                    "question_uid": q_id,
+                    "question_text": q_text,
+                    "schema_type": schema_type,
+                    "is_choice": False,
+                    "survey_id": survey_json.get("id"),
+                    "survey_title": survey_json.get("title", "Unknown"),
+                    "source": "surveymonkey"
+                })
+                
+                # Add choice options
+                for choice in question.get("answers", {}).get("choices", []):
+                    choice_text = choice.get("text", "")
+                    if choice_text.strip():
+                        questions.append({
+                            "question_uid": f"{q_id}_choice_{choice.get('id', '')}",
+                            "question_text": f"{q_text} - {choice_text}",
+                            "schema_type": schema_type,
+                            "is_choice": True,
+                            "survey_id": survey_json.get("id"),
+                            "survey_title": survey_json.get("title", "Unknown"),
+                            "source": "surveymonkey"
+                        })
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Records", f"{len(question_bank_df):,}")
-        with col2:
-            csv_data = question_bank_df.to_csv(index=False)
-            st.download_button(
-                "📥 Download Question Bank CSV",
-                csv_data,
-                f"snowflake_question_bank_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
+        return questions
     
-    # Matching results export
-    if 'matching_results' in st.session_state:
-        st.subheader("🎯 Matching Results Export")
-        matching_results = st.session_state.matching_results
+    # Extract questions from selected surveys
+    all_questions = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, survey_id in enumerate(survey_ids):
+        status_text.text(f"🔍 Processing survey {survey_id} ({i+1}/{len(survey_ids)})...")
         
-        col1, col2 = st.columns(2)
+        survey_json = get_survey_details_with_retry(survey_id, token)
+        if survey_json:
+            questions = extract_questions_from_json(survey_json)
+            all_questions.extend(questions)
+        
+        progress_bar.progress((i + 1) / len(survey_ids))
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if all_questions:
+        # Convert to DataFrame and store in session
+        questions_df = pd.DataFrame(all_questions)
+        st.session_state.surveymonkey_questions = questions_df
+        
+        # Success metrics
+        st.success(f"✅ Extracted {len(all_questions)} questions from {len(survey_ids)} surveys!")
+        
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Matched Questions", f"{len(matching_results):,}")
+            main_questions = len(questions_df[questions_df["is_choice"] == False])
+            st.metric("❓ Main Questions", main_questions)
         with col2:
-            csv_data = matching_results.to_csv(index=False)
-            st.download_button(
-                "📥 Download Matching Results CSV",
-                csv_data,
-                f"snowflake_matching_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
-
-# ============= MAIN APPLICATION =============
-
-def main():
-    """Main Streamlit application"""
-    
-    st.title("❄️ Snowflake-Optimized UID Management System")
-    st.markdown("*Enhanced question bank building and UID matching with direct Snowflake integration*")
-    
-    # Navigation - restore original tab structure
-    tab1, tab2, tab3 = st.tabs([
-        "🏗️ Question Bank Builder", 
-        "🎯 UID Matching",
-        "📤 Export Results"
-    ])
-    
-    with tab1:
-        show_snowflake_question_bank_builder()
-    
-    with tab2:
-        show_snowflake_matching()
-    
-    with tab3:
-        show_snowflake_export()
+            choices = len(questions_df[questions_df["is_choice"] == True])
+            st.metric("🔘 Choice Options", choices)
+        with col3:
+            unique_surveys = questions_df["survey_id"].nunique()
+            st.metric("📊 Surveys", unique_surveys)
+        
+        # Preview
+        st.subheader("🔍 Questions Preview")
+        show_main_only = st.checkbox("Show main questions only", value=True)
+        display_df = questions_df[questions_df["is_choice"] == False] if show_main_only else questions_df
+        
+        st.dataframe(
+            display_df[["question_text", "schema_type", "survey_title"]].head(20),
+            use_container_width=True
+        )
+        
+        # Next steps
+        st.subheader("➡️ Next Steps")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🏗️ Build Question Bank", type="primary"):
+                # Use SurveyMonkey questions for question bank
+                st.session_state.current_page = 'question_bank_builder'
+                st.rerun()
+        
+        with col2:
+            if st.button("🎯 Start UID Matching"):
+                st.session_state.current_page = 'uid_matching'
+                st.rerun()
+        
+    else:
+        st.error("❌ No questions extracted from selected surveys")
 
 if __name__ == "__main__":
     main() 
